@@ -1,14 +1,12 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionKey(pub Vec<u8>);
+
+pub trait KeyExchange {
+    fn public_key(&self) -> &[u8];
+    fn complete(&self, peer_public_key: &[u8]) -> std::io::Result<SessionKey>;
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
+pub trait Encryptor {
+    fn encrypt(&self, plaintext: &[u8]) -> std::io::Result<Vec<u8>>;
+    fn decrypt(&self, ciphertext: &[u8]) -> std::io::Result<Vec<u8>>;
 }

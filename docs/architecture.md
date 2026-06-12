@@ -170,3 +170,19 @@ Every subsystem should be independently replaceable.
 ### Scalability
 
 Architecture should support future desktop, mobile, and distributed deployments.
+
+---
+
+## Architecture Decisions
+
+### MVP Integrity Hashing
+
+For MVP v0.1, SHA-256 chunk and file integrity hashing is implemented in the transfer engine.
+
+Reason:
+
+* Chunk and manifest hashes are part of file chunking, resume validation, and transfer completion.
+* This does not include encryption, key exchange, authentication, or session protection.
+* End-to-end encryption primitives remain the responsibility of the crypto layer.
+
+This keeps MVP integrity verification close to transfer orchestration while preserving the crypto layer boundary for Phase 5 encryption work.
