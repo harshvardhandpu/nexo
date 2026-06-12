@@ -18,3 +18,18 @@ pub struct Checkpoint {
     pub transfer_id: TransferId,
     pub completed_chunks: Vec<ChunkId>,
 }
+
+#[derive(Debug, Clone)]
+pub struct Chunk {
+    pub id: ChunkId,
+    pub offset: u64,
+    pub size: u64,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChunkMetadata {
+    pub id: ChunkId,
+    pub offset: u64,
+    pub size: u64,
+}
