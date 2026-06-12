@@ -8,6 +8,12 @@ pub struct PeerId(pub String);
 pub struct SessionId(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ConnectionId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StreamId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ChunkId(pub u64);
 
 pub const DEFAULT_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
@@ -192,6 +198,177 @@ pub struct SessionTransitionError {
     pub to: SessionState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageCategory {
+    Session,
+    Control,
+    Chunk,
+    Verification,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferMessage {
+    Session(TransferSessionMessage),
+    Control(TransferControlMessage),
+    Chunk(TransferChunkMessage),
+    Verification(TransferVerificationMessage),
+}
+
+impl TransferMessage {
+    pub fn category(&self) -> MessageCategory {
+        match self {
+            TransferMessage::Session(_) => MessageCategory::Session,
+            TransferMessage::Control(_) => MessageCategory::Control,
+            TransferMessage::Chunk(_) => MessageCategory::Chunk,
+            TransferMessage::Verification(_) => MessageCategory::Verification,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferSessionMessage {
+    Request(TransferRequest),
+    Response(TransferResponse),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferControlMessage {
+    Pause {
+        transfer_id: TransferId,
+    },
+    Resume {
+        transfer_id: TransferId,
+    },
+    Cancel {
+        transfer_id: TransferId,
+        reason: String,
+    },
+    Checkpoint(Checkpoint),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferChunkMessage {
+    Metadata(ChunkMetadata),
+    Data(Chunk),
+    Missing(MissingChunks),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferVerificationMessage {
+    ChunkVerified {
+        chunk_id: ChunkId,
+    },
+    ChunkRejected {
+        chunk_id: ChunkId,
+        reason: String,
+    },
+    FileVerified {
+        transfer_id: TransferId,
+    },
+    FileRejected {
+        transfer_id: TransferId,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageEnvelope {
+    pub session_id: SessionId,
+    pub transfer_id: TransferId,
+    pub message: TransferMessage,
+}
+
+impl MessageEnvelope {
+    pub fn category(&self) -> MessageCategory {
+        self.message.category()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportError {
+    ConnectionFailed {
+        connection_id: Option<ConnectionId>,
+        reason: String,
+    },
+    ConnectionClosed {
+        connection_id: ConnectionId,
+    },
+    StreamFailed {
+        connection_id: ConnectionId,
+        stream_id: StreamId,
+        reason: String,
+    },
+    MessageRejected {
+        reason: String,
+    },
+    Timeout {
+        reason: String,
+    },
+    Protocol {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportEvent {
+    Connecting {
+        connection_id: ConnectionId,
+        peer_id: PeerId,
+    },
+    Connected {
+        connection_id: ConnectionId,
+        peer_id: PeerId,
+    },
+    StreamOpened {
+        connection_id: ConnectionId,
+        stream_id: StreamId,
+    },
+    MessageSent {
+        connection_id: ConnectionId,
+        stream_id: StreamId,
+        envelope: MessageEnvelope,
+    },
+    MessageReceived {
+        connection_id: ConnectionId,
+        stream_id: StreamId,
+        envelope: MessageEnvelope,
+    },
+    StreamClosed {
+        connection_id: ConnectionId,
+        stream_id: StreamId,
+    },
+    Closed {
+        connection_id: ConnectionId,
+    },
+    Failed {
+        error: TransportError,
+    },
+}
+
+impl TransportEvent {
+    pub fn session_state_hint(&self) -> Option<SessionState> {
+        match self {
+            TransportEvent::Connecting { .. } => Some(SessionState::Connecting),
+            TransportEvent::Connected { .. } => Some(SessionState::PendingAcceptance),
+            TransportEvent::MessageReceived { envelope, .. }
+            | TransportEvent::MessageSent { envelope, .. } => match &envelope.message {
+                TransferMessage::Session(TransferSessionMessage::Response(
+                    TransferResponse::Accepted(_),
+                )) => Some(SessionState::Accepted),
+                TransferMessage::Control(TransferControlMessage::Pause { .. }) => {
+                    Some(SessionState::Paused)
+                }
+                TransferMessage::Verification(TransferVerificationMessage::FileVerified {
+                    ..
+                }) => Some(SessionState::Completed),
+                _ => None,
+            },
+            TransportEvent::Failed { .. } => Some(SessionState::Failed),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,6 +489,127 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transfer_messages_report_categories() {
+        let transfer_id = TransferId("transfer-1".to_owned());
+
+        assert_eq!(
+            TransferMessage::Control(TransferControlMessage::Pause {
+                transfer_id: transfer_id.clone(),
+            })
+            .category(),
+            MessageCategory::Control
+        );
+        assert_eq!(
+            TransferMessage::Chunk(TransferChunkMessage::Missing(MissingChunks {
+                transfer_id: transfer_id.clone(),
+                chunks: vec![ChunkId(1)],
+            }))
+            .category(),
+            MessageCategory::Chunk
+        );
+        assert_eq!(
+            TransferMessage::Verification(TransferVerificationMessage::FileVerified {
+                transfer_id,
+            })
+            .category(),
+            MessageCategory::Verification
+        );
+    }
+
+    #[test]
+    fn transport_event_flow_provides_session_state_hints() {
+        let connection_id = ConnectionId("connection-1".to_owned());
+        let peer_id = PeerId("peer-b".to_owned());
+        let stream_id = StreamId("stream-1".to_owned());
+        let envelope = accepted_envelope();
+
+        let events = [
+            TransportEvent::Connecting {
+                connection_id: connection_id.clone(),
+                peer_id: peer_id.clone(),
+            },
+            TransportEvent::Connected {
+                connection_id: connection_id.clone(),
+                peer_id,
+            },
+            TransportEvent::StreamOpened {
+                connection_id: connection_id.clone(),
+                stream_id: stream_id.clone(),
+            },
+            TransportEvent::MessageReceived {
+                connection_id,
+                stream_id,
+                envelope,
+            },
+        ];
+
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(TransportEvent::session_state_hint)
+                .collect::<Vec<_>>(),
+            vec![
+                SessionState::Connecting,
+                SessionState::PendingAcceptance,
+                SessionState::Accepted,
+            ]
+        );
+    }
+
+    #[test]
+    fn transport_events_can_drive_valid_session_transitions() {
+        let mut session = test_session();
+        let connection_id = ConnectionId("connection-1".to_owned());
+        let peer_id = PeerId("peer-b".to_owned());
+        let stream_id = StreamId("stream-1".to_owned());
+
+        let events = [
+            TransportEvent::Connecting {
+                connection_id: connection_id.clone(),
+                peer_id: peer_id.clone(),
+            },
+            TransportEvent::Connected {
+                connection_id: connection_id.clone(),
+                peer_id,
+            },
+            TransportEvent::MessageReceived {
+                connection_id,
+                stream_id,
+                envelope: accepted_envelope(),
+            },
+        ];
+
+        for event in events {
+            if let Some(next) = event.session_state_hint() {
+                session.transition_to(next).expect("valid transition");
+            }
+        }
+
+        assert_eq!(session.state, SessionState::Accepted);
+    }
+
+    #[test]
+    fn transport_event_invalid_session_transition_is_rejected() {
+        let mut session = test_session();
+        let event = TransportEvent::MessageReceived {
+            connection_id: ConnectionId("connection-1".to_owned()),
+            stream_id: StreamId("stream-1".to_owned()),
+            envelope: accepted_envelope(),
+        };
+
+        let next = event.session_state_hint().expect("state hint");
+        let error = session.transition_to(next).expect_err("invalid transition");
+
+        assert_eq!(
+            error,
+            SessionTransitionError {
+                from: SessionState::Created,
+                to: SessionState::Accepted,
+            }
+        );
+    }
+
     fn accepted_session() -> SessionInfo {
         let mut session = test_session();
         session
@@ -333,5 +631,18 @@ mod tests {
             PeerId("peer-a".to_owned()),
             PeerId("peer-b".to_owned()),
         )
+    }
+
+    fn accepted_envelope() -> MessageEnvelope {
+        MessageEnvelope {
+            session_id: SessionId("session-1".to_owned()),
+            transfer_id: TransferId("transfer-1".to_owned()),
+            message: TransferMessage::Session(TransferSessionMessage::Response(
+                TransferResponse::Accepted(TransferAcceptance {
+                    session_id: SessionId("session-1".to_owned()),
+                    transfer_id: TransferId("transfer-1".to_owned()),
+                }),
+            )),
+        }
     }
 }

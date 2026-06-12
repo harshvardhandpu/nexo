@@ -2,7 +2,7 @@ pub mod chunker;
 
 use common::{
     Checkpoint, Chunk, ChunkId, ChunkMetadata, FileManifest, SessionId, SessionInfo, SessionState,
-    TransferProgress, TransferRequest, TransferResponse,
+    TransferProgress, TransferRequest, TransferResponse, TransportEvent,
 };
 use std::io::Result;
 
@@ -35,6 +35,14 @@ pub trait TransferSessionCoordinator {
 
 pub trait TransferSessionObserver {
     fn session_updated(&mut self, session: &SessionInfo);
+}
+
+pub trait TransportEventConsumer {
+    fn handle_transport_event(&mut self, event: TransportEvent) -> Result<()>;
+}
+
+pub trait TransportEventObserver {
+    fn transport_event_received(&mut self, event: &TransportEvent);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
