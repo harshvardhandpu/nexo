@@ -186,3 +186,13 @@ Reason:
 * End-to-end encryption primitives remain the responsibility of the crypto layer.
 
 This keeps MVP integrity verification close to transfer orchestration while preserving the crypto layer boundary for Phase 5 encryption work.
+
+### MVP Session Encryption Primitives
+
+For MVP v0.1, cryptographic session primitives are owned by the crypto crate and documented in `docs/crypto-layer.md`.
+
+Reason:
+
+* Key agreement and authenticated encryption are Phase 1 foundation requirements.
+* Networking and transport layers should move encrypted bytes without owning cryptographic policy.
+* The transfer engine should consume encryption as a boundary capability rather than implementing it directly.
