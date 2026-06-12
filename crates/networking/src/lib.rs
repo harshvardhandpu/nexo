@@ -5,6 +5,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
+pub mod quic;
+pub use quic::{QuicConnection, QuicListener, QuicStream, QuicTransportProvider};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredPeer {
     pub peer_id: PeerId,

@@ -1,24 +1,26 @@
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TransferId(pub String);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PeerId(pub String);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub String);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConnectionId(pub String);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StreamId(pub String);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChunkId(pub u64);
 
 pub const DEFAULT_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileManifest {
     pub name: String,
     pub size: u64,
@@ -27,32 +29,32 @@ pub struct FileManifest {
     pub sha256: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub transfer_id: TransferId,
     pub completed_chunks: Vec<ChunkId>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumeMetadata {
     pub transfer_id: TransferId,
     pub manifest: FileManifest,
     pub checkpoint: Checkpoint,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissingChunks {
     pub transfer_id: TransferId,
     pub chunks: Vec<ChunkId>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransferDirection {
     Send,
     Receive,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransferStatus {
     Pending,
     Running,
@@ -61,7 +63,7 @@ pub enum TransferStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferProgress {
     pub transfer_id: TransferId,
     pub completed_chunks: u64,
@@ -70,7 +72,7 @@ pub struct TransferProgress {
     pub total_bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Chunk {
     pub id: ChunkId,
     pub offset: u64,
@@ -78,7 +80,7 @@ pub struct Chunk {
     pub data: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkMetadata {
     pub id: ChunkId,
     pub offset: u64,
@@ -86,7 +88,7 @@ pub struct ChunkMetadata {
     pub sha256: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferRequest {
     pub session_id: SessionId,
     pub transfer_id: TransferId,
@@ -95,25 +97,25 @@ pub struct TransferRequest {
     pub manifest: FileManifest,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferAcceptance {
     pub session_id: SessionId,
     pub transfer_id: TransferId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferRejection {
     pub session_id: SessionId,
     pub reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransferResponse {
     Accepted(TransferAcceptance),
     Rejected(TransferRejection),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionState {
     Created,
     Connecting,
@@ -154,7 +156,7 @@ impl SessionState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub session_id: SessionId,
     pub transfer_id: TransferId,
@@ -192,13 +194,13 @@ impl SessionInfo {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionTransitionError {
     pub from: SessionState,
     pub to: SessionState,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageCategory {
     Session,
     Control,
@@ -206,7 +208,7 @@ pub enum MessageCategory {
     Verification,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransferMessage {
     Session(TransferSessionMessage),
     Control(TransferControlMessage),
@@ -225,13 +227,13 @@ impl TransferMessage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransferSessionMessage {
     Request(TransferRequest),
     Response(TransferResponse),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransferControlMessage {
     Pause {
         transfer_id: TransferId,
@@ -246,14 +248,14 @@ pub enum TransferControlMessage {
     Checkpoint(Checkpoint),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransferChunkMessage {
     Metadata(ChunkMetadata),
     Data(Chunk),
     Missing(MissingChunks),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransferVerificationMessage {
     ChunkVerified {
         chunk_id: ChunkId,
@@ -271,7 +273,7 @@ pub enum TransferVerificationMessage {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageEnvelope {
     pub session_id: SessionId,
     pub transfer_id: TransferId,
@@ -284,7 +286,7 @@ impl MessageEnvelope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransportError {
     ConnectionFailed {
         connection_id: Option<ConnectionId>,
@@ -309,7 +311,7 @@ pub enum TransportError {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransportEvent {
     Connecting {
         connection_id: ConnectionId,
