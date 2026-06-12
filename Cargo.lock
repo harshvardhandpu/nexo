@@ -81,6 +81,9 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 [[package]]
 name = "networking"
 version = "0.1.0"
+dependencies = [
+ "common",
+]
 
 [[package]]
 name = "sha2"

@@ -1,6 +1,9 @@
 pub mod chunker;
 
-use common::{Checkpoint, Chunk, ChunkId, ChunkMetadata, FileManifest, TransferProgress};
+use common::{
+    Checkpoint, Chunk, ChunkId, ChunkMetadata, FileManifest, SessionId, SessionInfo, SessionState,
+    TransferProgress, TransferRequest, TransferResponse,
+};
 use std::io::Result;
 
 pub trait ChunkSource {
@@ -18,6 +21,20 @@ pub trait TransferProgressSink {
 pub trait ChunkScheduler {
     fn next_chunk(&mut self) -> Option<ChunkId>;
     fn mark_completed(&mut self, chunk_id: ChunkId);
+}
+
+pub trait TransferSessionCoordinator {
+    fn create_session(&mut self, request: TransferRequest) -> Result<SessionInfo>;
+    fn respond_to_transfer(&mut self, response: TransferResponse) -> Result<SessionInfo>;
+    fn transition_session(
+        &mut self,
+        session_id: &SessionId,
+        state: SessionState,
+    ) -> Result<SessionInfo>;
+}
+
+pub trait TransferSessionObserver {
+    fn session_updated(&mut self, session: &SessionInfo);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
