@@ -1,4 +1,5 @@
 pub mod chunker;
+pub mod pipeline;
 
 use common::{
     Checkpoint, Chunk, ChunkId, ChunkMetadata, FileManifest, SessionId, SessionInfo, SessionState,

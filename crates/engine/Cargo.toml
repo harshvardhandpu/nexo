@@ -6,3 +6,8 @@ edition = "2024"
 [dependencies]
 common = { path = "../common" }
 sha2 = "0.10"
+
+[dev-dependencies]
+crypto = { path = "../crypto" }
+networking = { path = "../networking" }
+storage = { path = "../storage" }

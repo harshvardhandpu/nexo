@@ -167,7 +167,10 @@ name = "engine"
 version = "0.1.0"
 dependencies = [
  "common",
+ "crypto",
+ "networking",
  "sha2",
+ "storage",
 ]
 
 [[package]]
