@@ -1,12 +1,12 @@
 use common::{
-    ChunkId, PeerId, SessionId, SessionState, TransferId, TransferMessage,
+    Checkpoint, ChunkId, PeerId, SessionId, SessionState, TransferId, TransferMessage,
     TransferVerificationMessage,
 };
 use crypto::{Encryptor, EphemeralKeyPair, KeyExchange, SessionCipher};
 use engine::chunker::sha256_file;
 use engine::pipeline::{
     PipelineResult, TransferPayloadCipher, TransferPipelineConfig, TransferPipelineError,
-    TransferPipelineReceiver, TransferPipelineSender,
+    TransferPipelineReceiver, TransferPipelineSender, reconcile_checkpoint,
 };
 use networking::{
     LoopbackTransportProvider, TransportConnection, TransportListener, TransportProvider,
@@ -265,6 +265,27 @@ fn interrupted_transfer_resumes_from_checkpoint() {
             .state,
         SessionState::Completed
     );
+}
+
+#[test]
+fn checkpoint_reconciliation_keeps_only_verified_destination_chunks() {
+    let workspace = TempWorkspace::new("reconcile-checkpoint");
+    let source = workspace.path("source.bin");
+    let output = workspace.path("received.bin");
+    let data = b"first-oksecond-badthird";
+    write_file(&source, data);
+    write_file(&output, b"first-okcorrupted!");
+
+    let sender = TransferPipelineSender::prepare(&source, config(8)).expect("sender pipeline");
+    let checkpoint = Checkpoint {
+        transfer_id: transfer_id(),
+        completed_chunks: vec![ChunkId(0), ChunkId(1), ChunkId(99), ChunkId(0)],
+    };
+
+    let reconciled = reconcile_checkpoint(&output, &checkpoint, &sender.plan().chunks)
+        .expect("reconcile checkpoint");
+
+    assert_eq!(reconciled.completed_chunks, vec![ChunkId(0)]);
 }
 
 fn exchange_request_and_acceptance(

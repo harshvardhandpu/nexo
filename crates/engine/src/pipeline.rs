@@ -215,33 +215,85 @@ impl TransferPipelineSender {
                 continue;
             }
 
-            let plaintext = read_chunk(&self.source_path, metadata)?;
-            if !verify_chunk(&plaintext, metadata) {
-                return Err(TransferPipelineError::ChunkVerificationFailed(
-                    metadata.id.clone(),
-                ));
-            }
-
-            let encrypted = cipher.encrypt_chunk(&metadata.id, &plaintext.data)?;
-            envelopes.push(MessageEnvelope {
-                session_id: self.config.session_id.clone(),
-                transfer_id: self.config.transfer_id.clone(),
-                message: TransferMessage::Chunk(TransferChunkMessage::Data(Chunk {
-                    id: metadata.id.clone(),
-                    offset: metadata.offset,
-                    size: encrypted.len() as u64,
-                    data: encrypted,
-                })),
-            });
+            envelopes.push(self.chunk_envelope(&metadata.id, cipher)?);
         }
 
         Ok(envelopes)
+    }
+
+    pub fn chunk_envelope<C: TransferPayloadCipher>(
+        &self,
+        chunk_id: &ChunkId,
+        cipher: &C,
+    ) -> PipelineResult<MessageEnvelope> {
+        let metadata = self
+            .plan
+            .metadata_for(chunk_id)
+            .ok_or_else(|| TransferPipelineError::ChunkNotFound(chunk_id.clone()))?;
+        let plaintext = read_chunk(&self.source_path, metadata)?;
+        if !verify_chunk(&plaintext, metadata) {
+            return Err(TransferPipelineError::ChunkVerificationFailed(
+                metadata.id.clone(),
+            ));
+        }
+
+        let encrypted = cipher.encrypt_chunk(&metadata.id, &plaintext.data)?;
+        Ok(MessageEnvelope {
+            session_id: self.config.session_id.clone(),
+            transfer_id: self.config.transfer_id.clone(),
+            message: TransferMessage::Chunk(TransferChunkMessage::Data(Chunk {
+                id: metadata.id.clone(),
+                offset: metadata.offset,
+                size: encrypted.len() as u64,
+                data: encrypted,
+            })),
+        })
     }
 
     pub fn complete_session(&self, session: &mut SessionInfo) -> PipelineResult<()> {
         transition_session(session, SessionState::Verifying)?;
         transition_session(session, SessionState::Completed)
     }
+}
+
+pub fn reconcile_checkpoint<P: AsRef<Path>>(
+    output_path: P,
+    checkpoint: &Checkpoint,
+    chunks: &[ChunkMetadata],
+) -> PipelineResult<Checkpoint> {
+    let output_path = output_path.as_ref();
+    let chunk_index = chunks
+        .iter()
+        .map(|metadata| (metadata.id.clone(), metadata))
+        .collect::<HashMap<_, _>>();
+    let mut completed_chunks = Vec::new();
+
+    for chunk_id in &checkpoint.completed_chunks {
+        let Some(metadata) = chunk_index.get(chunk_id) else {
+            continue;
+        };
+
+        match read_chunk(output_path, metadata) {
+            Ok(chunk) if verify_chunk(&chunk, metadata) => {
+                if !completed_chunks.contains(chunk_id) {
+                    completed_chunks.push(chunk_id.clone());
+                }
+            }
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::UnexpectedEof
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    completed_chunks.sort_by_key(|chunk_id| chunk_id.0);
+    Ok(Checkpoint {
+        transfer_id: checkpoint.transfer_id.clone(),
+        completed_chunks,
+    })
 }
 
 #[derive(Debug)]
@@ -365,6 +417,7 @@ impl TransferPipelineReceiver {
             .as_ref()
             .ok_or(TransferPipelineError::InvalidMessage("manifest is missing"))?;
 
+        transition_session_if_needed(&mut self.session, SessionState::Transferring)?;
         transition_session_if_needed(&mut self.session, SessionState::Verifying)?;
         let actual = sha256_file(&self.output_path)?;
 

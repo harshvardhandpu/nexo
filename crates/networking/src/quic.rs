@@ -10,6 +10,7 @@ use quinn::{ClientConfig, Endpoint, EndpointConfig, RecvStream, SendStream, Serv
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::{Arc, mpsc};
+use tokio::io::AsyncWriteExt;
 
 const LOCALHOST_SERVER_NAME: &str = "localhost";
 const STREAM_PREFACE: &[u8; 8] = b"NEXOQST1";
@@ -648,6 +649,13 @@ async fn write_frame(
             connection_id: connection_id.clone(),
             stream_id: stream_id.clone(),
             reason: format!("failed to write QUIC frame payload: {error}"),
+        })?;
+    send.flush()
+        .await
+        .map_err(|error| TransportError::StreamFailed {
+            connection_id: connection_id.clone(),
+            stream_id: stream_id.clone(),
+            reason: format!("failed to flush QUIC frame: {error}"),
         })
 }
 

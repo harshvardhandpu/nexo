@@ -235,6 +235,13 @@ pub enum TransferSessionMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransferControlMessage {
+    KeyExchange {
+        transfer_id: TransferId,
+        public_key: Vec<u8>,
+    },
+    Acknowledged {
+        transfer_id: TransferId,
+    },
     Pause {
         transfer_id: TransferId,
     },
@@ -310,6 +317,45 @@ pub enum TransportError {
         reason: String,
     },
 }
+
+impl std::fmt::Display for TransportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransportError::ConnectionFailed {
+                connection_id,
+                reason,
+            } => match connection_id {
+                Some(connection_id) => {
+                    write!(
+                        formatter,
+                        "connection failed ({}): {reason}",
+                        connection_id.0
+                    )
+                }
+                None => write!(formatter, "connection failed: {reason}"),
+            },
+            TransportError::ConnectionClosed { connection_id } => {
+                write!(formatter, "connection closed: {}", connection_id.0)
+            }
+            TransportError::StreamFailed {
+                connection_id,
+                stream_id,
+                reason,
+            } => write!(
+                formatter,
+                "stream failed (connection {}, stream {}): {reason}",
+                connection_id.0, stream_id.0
+            ),
+            TransportError::MessageRejected { reason } => {
+                write!(formatter, "message rejected: {reason}")
+            }
+            TransportError::Timeout { reason } => write!(formatter, "timeout: {reason}"),
+            TransportError::Protocol { reason } => write!(formatter, "protocol error: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for TransportError {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransportEvent {
