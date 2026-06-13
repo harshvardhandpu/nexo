@@ -2,6 +2,7 @@
 resolver = "2"
 
 members = [
+    "apps/desktop/src-tauri",
     "crates/cli",
     "crates/common",
     "crates/engine",
@@ -9,3 +10,6 @@ members = [
     "crates/crypto",
     "crates/storage"
 ]
+
+[workspace.dependencies]
+time = "=0.3.44"

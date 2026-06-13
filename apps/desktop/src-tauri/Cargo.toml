@@ -1,0 +1,27 @@
+[package]
+name = "nexo-desktop"
+version = "0.1.0"
+description = "Nexo desktop application"
+edition = "2024"
+
+[lib]
+name = "nexo_desktop"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "nexo-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+cli = { path = "../../../crates/cli" }
+common = { path = "../../../crates/common" }
+engine = { path = "../../../crates/engine" }
+networking = { path = "../../../crates/networking" }
+crypto = { path = "../../../crates/crypto" }
+storage = { path = "../../../crates/storage" }
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = [] }
+time = { workspace = true }

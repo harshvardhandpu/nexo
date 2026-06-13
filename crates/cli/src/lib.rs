@@ -81,21 +81,87 @@ impl CliConfig {
         })
     }
 
-    fn database_path(&self) -> PathBuf {
+    pub fn database_path(&self) -> PathBuf {
         self.state_dir.join(STATE_DATABASE_FILE)
     }
 
-    fn receiver_peer_path(&self) -> PathBuf {
+    pub fn receiver_peer_path(&self) -> PathBuf {
         self.state_dir.join(RECEIVER_PEER_FILE)
     }
 
-    fn latest_transfer_path(&self) -> PathBuf {
+    pub fn latest_transfer_path(&self) -> PathBuf {
         self.state_dir.join(LATEST_TRANSFER_FILE)
     }
 
-    fn peer_id_path(&self) -> PathBuf {
+    pub fn peer_id_path(&self) -> PathBuf {
         self.state_dir.join(PEER_ID_FILE)
     }
+
+    pub fn app_paths(&self) -> CliStatePaths {
+        CliStatePaths {
+            state_dir: self.state_dir.clone(),
+            receive_dir: self.receive_dir.clone(),
+            database: self.database_path(),
+            receiver_peer: self.receiver_peer_path(),
+            latest_transfer: self.latest_transfer_path(),
+            peer_id: self.peer_id_path(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliStatePaths {
+    pub state_dir: PathBuf,
+    pub receive_dir: PathBuf,
+    pub database: PathBuf,
+    pub receiver_peer: PathBuf,
+    pub latest_transfer: PathBuf,
+    pub peer_id: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredPeer {
+    pub peer_id: String,
+    pub display_name: String,
+    pub addresses: Vec<String>,
+    pub port: u16,
+}
+
+impl From<PeerInfo> for DiscoveredPeer {
+    fn from(peer: PeerInfo) -> Self {
+        Self {
+            peer_id: peer.peer_id.0,
+            display_name: peer.display_name,
+            addresses: peer
+                .addresses
+                .into_iter()
+                .map(|address| address.to_string())
+                .collect(),
+            port: peer.port,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiverEndpoint {
+    pub address: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferStatusSnapshot {
+    pub latest: Option<TransferStatusDetails>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferStatusDetails {
+    pub transfer_id: String,
+    pub session_id: String,
+    pub state: Option<String>,
+    pub file_name: Option<String>,
+    pub completed_chunks: u64,
+    pub total_chunks: u64,
+    pub completed_bytes: u64,
+    pub total_bytes: u64,
 }
 
 pub fn main_entry() -> CliResult<()> {
@@ -122,6 +188,20 @@ fn run_discover_for<W: Write>(
     output: &mut W,
     duration: Duration,
 ) -> CliResult<()> {
+    let peers = discover_peers_for(config, duration)?;
+    write_discovered_peers(&peers, output)?;
+
+    Ok(())
+}
+
+pub fn discover_peers(config: &CliConfig) -> CliResult<Vec<DiscoveredPeer>> {
+    discover_peers_for(config, DISCOVERY_DURATION)
+}
+
+pub fn discover_peers_for(
+    config: &CliConfig,
+    duration: Duration,
+) -> CliResult<Vec<DiscoveredPeer>> {
     fs::create_dir_all(&config.state_dir)?;
     let peer_id = load_or_create_peer_id(config)?;
     let display_name = local_display_name(&peer_id)?;
@@ -136,14 +216,17 @@ fn run_discover_for<W: Write>(
         discovery.next_event(remaining)?;
     }
 
-    let peers = discovery.peers();
+    let peers = discovery
+        .peers()
+        .into_iter()
+        .map(DiscoveredPeer::from)
+        .collect();
     discovery.shutdown()?;
-    write_discovered_peers(&peers, output)?;
 
-    Ok(())
+    Ok(peers)
 }
 
-fn write_discovered_peers<W: Write>(peers: &[PeerInfo], output: &mut W) -> CliResult<()> {
+fn write_discovered_peers<W: Write>(peers: &[DiscoveredPeer], output: &mut W) -> CliResult<()> {
     writeln!(output, "Found peers:")?;
     if peers.is_empty() {
         writeln!(output, "(none)")?;
@@ -369,44 +452,81 @@ pub fn run_send<W: Write>(
 }
 
 pub fn run_status<W: Write>(config: &CliConfig, output: &mut W) -> CliResult<()> {
-    let latest = match load_latest(config)? {
+    let snapshot = transfer_status_snapshot(config)?;
+    let latest = match snapshot.latest {
         Some(latest) => latest,
         None => {
             writeln!(output, "No transfers recorded")?;
             return Ok(());
         }
     };
-    let storage = storage(config)?;
-    let session = storage.load_session(&latest.session_id)?;
-    let metadata = storage.load_resume_metadata(&latest.transfer_id)?;
 
-    writeln!(output, "Transfer: {}", latest.transfer_id.0)?;
-    if let Some(session) = session {
-        writeln!(output, "Session: {}", session.session_id.0)?;
-        writeln!(output, "State: {:?}", session.state)?;
+    writeln!(output, "Transfer: {}", latest.transfer_id)?;
+    writeln!(output, "Session: {}", latest.session_id)?;
+    if let Some(state) = latest.state {
+        writeln!(output, "State: {state}")?;
     }
 
-    if let Some(metadata) = metadata {
-        let completed_chunks = metadata.checkpoint.completed_chunks.len() as u64;
-        let completed_bytes =
-            completed_bytes_from_manifest(&metadata.manifest, &metadata.checkpoint);
-
-        writeln!(output, "File: {}", metadata.manifest.name)?;
+    if let Some(file_name) = latest.file_name {
+        writeln!(output, "File: {file_name}")?;
         writeln!(
             output,
-            "Chunks: {completed_chunks}/{}",
-            metadata.manifest.total_chunks
+            "Chunks: {}/{}",
+            latest.completed_chunks, latest.total_chunks
         )?;
         writeln!(
             output,
-            "Bytes: {completed_bytes}/{}",
-            metadata.manifest.size
+            "Bytes: {}/{}",
+            latest.completed_bytes, latest.total_bytes
         )?;
     } else {
         writeln!(output, "No resume metadata recorded")?;
     }
 
     Ok(())
+}
+
+pub fn receiver_endpoint(config: &CliConfig) -> CliResult<Option<ReceiverEndpoint>> {
+    if !config.receiver_peer_path().exists() {
+        return Ok(None);
+    }
+
+    let advert = load_receiver_advert(config)?;
+    Ok(Some(ReceiverEndpoint {
+        address: advert.address.to_string(),
+    }))
+}
+
+pub fn transfer_status_snapshot(config: &CliConfig) -> CliResult<TransferStatusSnapshot> {
+    let Some(latest) = load_latest(config)? else {
+        return Ok(TransferStatusSnapshot { latest: None });
+    };
+    let storage = storage(config)?;
+    let session = storage.load_session(&latest.session_id)?;
+    let metadata = storage.load_resume_metadata(&latest.transfer_id)?;
+    let (file_name, completed_chunks, total_chunks, completed_bytes, total_bytes) = match metadata {
+        Some(metadata) => (
+            Some(metadata.manifest.name.clone()),
+            metadata.checkpoint.completed_chunks.len() as u64,
+            metadata.manifest.total_chunks,
+            completed_bytes_from_manifest(&metadata.manifest, &metadata.checkpoint),
+            metadata.manifest.size,
+        ),
+        None => (None, 0, 0, 0, 0),
+    };
+
+    Ok(TransferStatusSnapshot {
+        latest: Some(TransferStatusDetails {
+            transfer_id: latest.transfer_id.0,
+            session_id: latest.session_id.0,
+            state: session.map(|session| format!("{:?}", session.state)),
+            file_name,
+            completed_chunks,
+            total_chunks,
+            completed_bytes,
+            total_bytes,
+        }),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -948,6 +1068,68 @@ mod tests {
     }
 
     #[test]
+    fn app_paths_expose_state_files_for_desktop() {
+        let config = test_config("app-paths");
+        let paths = config.app_paths();
+
+        assert_eq!(paths.state_dir, config.state_dir);
+        assert_eq!(paths.receive_dir, config.receive_dir);
+        assert_eq!(
+            paths.database.file_name().and_then(|name| name.to_str()),
+            Some(STATE_DATABASE_FILE)
+        );
+        assert_eq!(
+            paths
+                .receiver_peer
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some(RECEIVER_PEER_FILE)
+        );
+        assert_eq!(
+            paths
+                .latest_transfer
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some(LATEST_TRANSFER_FILE)
+        );
+        assert_eq!(
+            paths.peer_id.file_name().and_then(|name| name.to_str()),
+            Some(PEER_ID_FILE)
+        );
+    }
+
+    #[test]
+    fn transfer_status_snapshot_reports_no_latest_transfer() {
+        let config = test_config("snapshot-empty");
+
+        let snapshot = transfer_status_snapshot(&config).expect("status snapshot");
+
+        assert_eq!(snapshot, TransferStatusSnapshot { latest: None });
+    }
+
+    #[test]
+    fn receiver_endpoint_reads_advertisement_for_desktop() {
+        let config = test_config("receiver-endpoint");
+        let advert = ReceiverAdvert {
+            address: "127.0.0.1:41000".parse().expect("address"),
+            certificate_der: vec![1, 2, 3, 4],
+        };
+        fs::create_dir_all(&config.state_dir).expect("state dir");
+        save_receiver_advert(&config, &advert).expect("save advert");
+
+        let endpoint = receiver_endpoint(&config)
+            .expect("receiver endpoint")
+            .expect("advert exists");
+
+        assert_eq!(
+            endpoint,
+            ReceiverEndpoint {
+                address: "127.0.0.1:41000".to_owned(),
+            }
+        );
+    }
+
+    #[test]
     fn local_peer_identity_is_persisted() {
         let config = test_config("peer-identity");
 
@@ -961,10 +1143,10 @@ mod tests {
 
     #[test]
     fn discover_output_lists_peers() {
-        let peers = vec![PeerInfo {
-            peer_id: PeerId("advertised-peer".to_owned()),
+        let peers = vec![DiscoveredPeer {
+            peer_id: "advertised-peer".to_owned(),
             display_name: "Harsh-Laptop".to_owned(),
-            addresses: vec![std::net::IpAddr::from([127, 0, 0, 1])],
+            addresses: vec!["127.0.0.1".to_owned()],
             port: 43001,
         }];
         let mut output = Vec::new();
