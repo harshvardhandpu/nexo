@@ -10,8 +10,9 @@ It connects:
 * storage checkpoints, sessions, and resume metadata
 * crypto session primitives for chunk payload encryption
 * QUIC localhost transport for real networking
+* local peer discovery for LAN visibility
 
-It does not implement GUI, Tauri, NAT traversal, relay networking, peer discovery, delta transfers, folder synchronization, mesh networking, multipath transfer, or production pairing.
+It does not implement GUI, Tauri, NAT traversal, relay networking, delta transfers, folder synchronization, mesh networking, multipath transfer, or production pairing.
 
 ---
 
@@ -19,10 +20,23 @@ It does not implement GUI, Tauri, NAT traversal, relay networking, peer discover
 
 ```text
 nexo receive
+nexo discover
 nexo send <file>
 nexo send <file> --host <address>
 nexo status
 ```
+
+### nexo discover
+
+Advertises the local CLI peer over mDNS for a short scan window and prints visible Nexo peers on the local network.
+
+The CLI stores a persistent local peer identity in:
+
+```text
+peer-id
+```
+
+This identity is used only for local discovery. It is not an authentication credential, pairing secret, or transport certificate.
 
 ### nexo receive
 
@@ -83,6 +97,7 @@ Files:
 state.sqlite
 receiver.peer
 latest-transfer
+peer-id
 ```
 
 `state.sqlite` is managed through the storage crate. The CLI does not create its own persistence schema.
@@ -97,6 +112,12 @@ receive
   -> write receiver.peer
   -> accept QUIC connection
   -> accept stream
+
+discover
+  -> load or create peer-id
+  -> advertise peer over mDNS
+  -> collect discovered local peers
+  -> print peer display names
 
 send
   -> read receiver.peer
@@ -160,6 +181,7 @@ For MVP bootstrapping:
 
 * receiver certificates are self-signed localhost certificates
 * sender trust comes from the locally stored receiver advertisement
+* discovery identities are informational and do not authenticate a transfer peer
 * long-term identity, pairing UX, certificate rotation, and authenticated device trust are future work
 
 The CLI does not weaken the networking crate by adding insecure certificate verification.
@@ -176,6 +198,5 @@ It does not:
 * persist checkpoints outside the storage crate
 * implement QUIC directly
 * own cryptographic primitives
-* discover peers
 * route through relays
 * decide future reconnect policy

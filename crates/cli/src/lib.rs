@@ -11,15 +11,17 @@ use engine::pipeline::{
     TransferPipelineReceiver, TransferPipelineSender, reconcile_checkpoint, transition_session,
 };
 use networking::{
-    QuicTransportProvider, TransportConnection, TransportListener, TransportProvider,
-    TransportStream,
+    LocalDiscoveryProvider, PeerAdvertisement, PeerDiscovery, PeerInfo, QuicTransportProvider,
+    TransportConnection, TransportListener, TransportProvider, TransportStream,
 };
+use rand_core::{OsRng, RngCore};
 use std::collections::HashSet;
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{Error as IoError, ErrorKind, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use storage::{
     CheckpointStore, ResumeMetadataStore, SessionStore, SqliteStorageBackend,
     Storage as PersistentStorage,
@@ -30,8 +32,10 @@ pub type CliResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 const RECEIVER_PEER_FILE: &str = "receiver.peer";
 const LATEST_TRANSFER_FILE: &str = "latest-transfer";
 const STATE_DATABASE_FILE: &str = "state.sqlite";
+const PEER_ID_FILE: &str = "peer-id";
 const SENDER_PEER: &str = "cli-sender";
 const RECEIVER_PEER: &str = "cli-receiver";
+const DISCOVERY_DURATION: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Parser)]
 #[command(name = "nexo")]
@@ -43,6 +47,7 @@ pub struct CliArgs {
 
 #[derive(Debug, Subcommand)]
 enum CliCommand {
+    Discover,
     Receive,
     Send {
         file: PathBuf,
@@ -87,6 +92,10 @@ impl CliConfig {
     fn latest_transfer_path(&self) -> PathBuf {
         self.state_dir.join(LATEST_TRANSFER_FILE)
     }
+
+    fn peer_id_path(&self) -> PathBuf {
+        self.state_dir.join(PEER_ID_FILE)
+    }
 }
 
 pub fn main_entry() -> CliResult<()> {
@@ -97,10 +106,54 @@ pub fn main_entry() -> CliResult<()> {
 
 pub fn run_cli<W: Write>(args: CliArgs, config: &CliConfig, output: &mut W) -> CliResult<()> {
     match args.command {
+        CliCommand::Discover => run_discover(config, output),
         CliCommand::Receive => run_receive(config, output),
         CliCommand::Send { file, host } => run_send(&file, host, config, output),
         CliCommand::Status => run_status(config, output),
     }
+}
+
+pub fn run_discover<W: Write>(config: &CliConfig, output: &mut W) -> CliResult<()> {
+    run_discover_for(config, output, DISCOVERY_DURATION)
+}
+
+fn run_discover_for<W: Write>(
+    config: &CliConfig,
+    output: &mut W,
+    duration: Duration,
+) -> CliResult<()> {
+    fs::create_dir_all(&config.state_dir)?;
+    let peer_id = load_or_create_peer_id(config)?;
+    let display_name = local_display_name(&peer_id)?;
+    let mut discovery =
+        LocalDiscoveryProvider::new(PeerAdvertisement::new(peer_id, display_name, 0))?;
+    let deadline = Instant::now()
+        .checked_add(duration)
+        .unwrap_or_else(Instant::now);
+
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        discovery.next_event(remaining)?;
+    }
+
+    let peers = discovery.peers();
+    discovery.shutdown()?;
+    write_discovered_peers(&peers, output)?;
+
+    Ok(())
+}
+
+fn write_discovered_peers<W: Write>(peers: &[PeerInfo], output: &mut W) -> CliResult<()> {
+    writeln!(output, "Found peers:")?;
+    if peers.is_empty() {
+        writeln!(output, "(none)")?;
+    } else {
+        for peer in peers {
+            writeln!(output, "* {}", peer.display_name)?;
+        }
+    }
+
+    Ok(())
 }
 
 pub fn run_cli_from<I, T, W>(args: I, config: &CliConfig, output: &mut W) -> CliResult<()>
@@ -410,6 +463,42 @@ fn storage(config: &CliConfig) -> CliResult<PersistentStorage<SqliteStorageBacke
     Ok(PersistentStorage::new(SqliteStorageBackend::open(
         config.database_path(),
     )?)?)
+}
+
+fn load_or_create_peer_id(config: &CliConfig) -> CliResult<PeerId> {
+    fs::create_dir_all(&config.state_dir)?;
+    let path = config.peer_id_path();
+    if path.exists() {
+        let value = fs::read_to_string(path)?;
+        let value = value.trim();
+        let valid = value.strip_prefix("peer-").is_some_and(|suffix| {
+            suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+        if !valid {
+            return Err(io_error(
+                ErrorKind::InvalidData,
+                "stored peer ID is invalid",
+            ));
+        }
+        return Ok(PeerId(value.to_owned()));
+    }
+
+    let mut random = [0u8; 16];
+    OsRng.fill_bytes(&mut random);
+    let peer_id = PeerId(format!("peer-{}", hex_encode(&random)));
+    fs::write(path, format!("{}\n", peer_id.0))?;
+    Ok(peer_id)
+}
+
+fn local_display_name(peer_id: &PeerId) -> CliResult<String> {
+    let hostname = hostname::get()?;
+    let hostname = hostname.to_string_lossy();
+    let hostname = hostname.trim();
+    if hostname.is_empty() {
+        return Ok(format!("Nexo-{}", &peer_id.0[..8]));
+    }
+
+    Ok(hostname.chars().take(200).collect())
 }
 
 fn load_receive_checkpoint(
@@ -829,6 +918,8 @@ mod tests {
 
     #[test]
     fn parses_required_commands() {
+        let discover = CliArgs::try_parse_from(["nexo", "discover"]).expect("discover parses");
+        assert!(matches!(discover.command, CliCommand::Discover));
         run_cli_from(
             ["nexo", "status"],
             &test_config("parse-status"),
@@ -854,6 +945,35 @@ mod tests {
             String::from_utf8(output).expect("utf8"),
             "No transfers recorded\n"
         );
+    }
+
+    #[test]
+    fn local_peer_identity_is_persisted() {
+        let config = test_config("peer-identity");
+
+        let first = load_or_create_peer_id(&config).expect("create peer ID");
+        let second = load_or_create_peer_id(&config).expect("load peer ID");
+
+        assert_eq!(first, second);
+        assert_eq!(first.0.len(), 37);
+        assert!(first.0.starts_with("peer-"));
+    }
+
+    #[test]
+    fn discover_output_lists_peers() {
+        let peers = vec![PeerInfo {
+            peer_id: PeerId("advertised-peer".to_owned()),
+            display_name: "Harsh-Laptop".to_owned(),
+            addresses: vec![std::net::IpAddr::from([127, 0, 0, 1])],
+            port: 43001,
+        }];
+        let mut output = Vec::new();
+
+        write_discovered_peers(&peers, &mut output).expect("discover output");
+
+        let output = String::from_utf8(output).expect("discover output");
+        assert!(output.contains("Found peers:\n"));
+        assert!(output.contains("* Harsh-Laptop\n"));
     }
 
     #[test]

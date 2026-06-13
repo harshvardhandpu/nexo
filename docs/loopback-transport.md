@@ -37,7 +37,6 @@ Responsibilities:
 * register a listener for the local peer
 * connect to a listening peer
 * create paired in-memory connections
-* expose discovered listening peers for tests
 
 ### LoopbackListener
 

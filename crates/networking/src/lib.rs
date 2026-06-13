@@ -5,18 +5,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
+pub mod discovery;
 pub mod quic;
+pub use discovery::{
+    DiscoveryEvent, LocalDiscoveryProvider, PeerAdvertisement, PeerDiscovery, PeerInfo,
+};
 pub use quic::{QuicConnection, QuicListener, QuicStream, QuicTransportProvider};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiscoveredPeer {
-    pub peer_id: PeerId,
-    pub display_name: String,
-}
-
-pub trait DiscoveryProvider {
-    fn discover_peers(&self) -> std::io::Result<Vec<DiscoveredPeer>>;
-}
 
 pub trait TransportProvider {
     type Listener: TransportListener;
@@ -128,26 +122,6 @@ impl LoopbackTransportProvider {
 
     pub fn local_peer(&self) -> &PeerId {
         &self.local_peer
-    }
-}
-
-impl DiscoveryProvider for LoopbackTransportProvider {
-    fn discover_peers(&self) -> std::io::Result<Vec<DiscoveredPeer>> {
-        let listeners = self
-            .network
-            .inner
-            .listeners
-            .lock()
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-
-        Ok(listeners
-            .keys()
-            .filter(|peer_id| *peer_id != &self.local_peer)
-            .map(|peer_id| DiscoveredPeer {
-                peer_id: peer_id.clone(),
-                display_name: peer_id.0.clone(),
-            })
-            .collect())
     }
 }
 
