@@ -10,7 +10,9 @@ pub mod quic;
 pub use discovery::{
     DiscoveryEvent, LocalDiscoveryProvider, PeerAdvertisement, PeerDiscovery, PeerInfo,
 };
-pub use quic::{QuicConnection, QuicListener, QuicStream, QuicTransportProvider};
+pub use quic::{
+    QuicConnection, QuicListener, QuicServerIdentity, QuicStream, QuicTransportProvider,
+};
 
 pub trait TransportProvider {
     type Listener: TransportListener;

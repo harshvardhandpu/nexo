@@ -22,6 +22,20 @@ pub struct QuicPeerConfig {
     pub certificate_der: Vec<u8>,
 }
 
+/// A reusable QUIC server identity (self-signed localhost certificate and its
+/// private key).
+///
+/// The transport generates a fresh identity on every `listen()` by default.
+/// Callers that need a *stable* listener identity across process restarts (for
+/// example, so a previously advertised address and certificate remain valid for
+/// a resuming peer) can generate an identity once, persist it, and rebind with
+/// it through [`QuicTransportProvider::listen_with_identity`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuicServerIdentity {
+    pub certificate_der: Vec<u8>,
+    pub private_key_der: Vec<u8>,
+}
+
 #[derive(Debug)]
 pub struct QuicTransportProvider {
     local_peer: PeerId,
@@ -59,6 +73,78 @@ impl QuicTransportProvider {
                 certificate_der,
             },
         );
+    }
+
+    /// Generates a fresh self-signed localhost server identity.
+    ///
+    /// The returned identity can be persisted and later reused with
+    /// [`Self::listen_with_identity`] so that a restarted listener keeps the
+    /// same certificate (and, when bound to the same address, the same
+    /// endpoint) that peers were previously told to trust.
+    pub fn generate_server_identity() -> Result<QuicServerIdentity, TransportError> {
+        let cert = rcgen::generate_simple_self_signed(vec![LOCALHOST_SERVER_NAME.to_owned()])
+            .map_err(|error| TransportError::Protocol {
+                reason: format!("failed to generate QUIC localhost certificate: {error}"),
+            })?;
+        let certificate_der = CertificateDer::from(cert.cert).as_ref().to_vec();
+        let private_key_der = cert.signing_key.serialize_der();
+
+        Ok(QuicServerIdentity {
+            certificate_der,
+            private_key_der,
+        })
+    }
+
+    /// Binds a listener using a caller-supplied [`QuicServerIdentity`] instead of
+    /// generating a fresh certificate.
+    ///
+    /// Combined with binding to a fixed address, this lets a restarted receiver
+    /// present the same address and certificate it advertised before, which is
+    /// what allows an interrupted sender to reconnect and resume.
+    pub fn listen_with_identity(
+        &mut self,
+        identity: &QuicServerIdentity,
+    ) -> Result<QuicListener, TransportError> {
+        let server_config = server_config_from_identity(identity)?;
+        self.bind_listener(server_config, identity.certificate_der.clone())
+    }
+
+    fn bind_listener(
+        &self,
+        server_config: ServerConfig,
+        certificate_der: Vec<u8>,
+    ) -> Result<QuicListener, TransportError> {
+        let socket =
+            UdpSocket::bind(self.bind_addr).map_err(|error| TransportError::ConnectionFailed {
+                connection_id: None,
+                reason: format!("failed to bind QUIC listener socket: {error}"),
+            })?;
+        let _runtime_guard = self.runtime.enter();
+        let endpoint = Endpoint::new(
+            EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .map_err(|error| TransportError::ConnectionFailed {
+            connection_id: None,
+            reason: format!("failed to create QUIC server endpoint: {error}"),
+        })?;
+        let local_addr =
+            endpoint
+                .local_addr()
+                .map_err(|error| TransportError::ConnectionFailed {
+                    connection_id: None,
+                    reason: format!("failed to read QUIC listener address: {error}"),
+                })?;
+
+        Ok(QuicListener {
+            local_peer: self.local_peer.clone(),
+            local_addr,
+            certificate_der,
+            endpoint,
+            runtime: self.runtime.clone(),
+        })
     }
 
     fn client_endpoint(&self, peer: &QuicPeerConfig) -> Result<Endpoint, TransportError> {
@@ -101,38 +187,8 @@ impl TransportProvider for QuicTransportProvider {
     type Connection = QuicConnection;
 
     fn listen(&mut self) -> Result<Self::Listener, TransportError> {
-        let (server_config, certificate_der) = server_config()?;
-        let socket =
-            UdpSocket::bind(self.bind_addr).map_err(|error| TransportError::ConnectionFailed {
-                connection_id: None,
-                reason: format!("failed to bind QUIC listener socket: {error}"),
-            })?;
-        let _runtime_guard = self.runtime.enter();
-        let endpoint = Endpoint::new(
-            EndpointConfig::default(),
-            Some(server_config),
-            socket,
-            Arc::new(quinn::TokioRuntime),
-        )
-        .map_err(|error| TransportError::ConnectionFailed {
-            connection_id: None,
-            reason: format!("failed to create QUIC server endpoint: {error}"),
-        })?;
-        let local_addr =
-            endpoint
-                .local_addr()
-                .map_err(|error| TransportError::ConnectionFailed {
-                    connection_id: None,
-                    reason: format!("failed to read QUIC listener address: {error}"),
-                })?;
-
-        Ok(QuicListener {
-            local_peer: self.local_peer.clone(),
-            local_addr,
-            certificate_der,
-            endpoint,
-            runtime: self.runtime.clone(),
-        })
+        let identity = Self::generate_server_identity()?;
+        self.listen_with_identity(&identity)
     }
 
     fn connect(
@@ -534,20 +590,16 @@ fn new_runtime() -> Result<Arc<tokio::runtime::Runtime>, TransportError> {
         })
 }
 
-fn server_config() -> Result<(ServerConfig, Vec<u8>), TransportError> {
-    let cert = rcgen::generate_simple_self_signed(vec![LOCALHOST_SERVER_NAME.to_owned()]).map_err(
-        |error| TransportError::Protocol {
-            reason: format!("failed to generate QUIC localhost certificate: {error}"),
-        },
-    )?;
-    let cert_der = CertificateDer::from(cert.cert);
-    let private_key = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
-    let server_config = ServerConfig::with_single_cert(vec![cert_der.clone()], private_key.into())
-        .map_err(|error| TransportError::Protocol {
+fn server_config_from_identity(
+    identity: &QuicServerIdentity,
+) -> Result<ServerConfig, TransportError> {
+    let cert_der = CertificateDer::from(identity.certificate_der.clone());
+    let private_key = PrivatePkcs8KeyDer::from(identity.private_key_der.clone());
+    ServerConfig::with_single_cert(vec![cert_der], private_key.into()).map_err(|error| {
+        TransportError::Protocol {
             reason: format!("failed to configure QUIC server certificate: {error}"),
-        })?;
-
-    Ok((server_config, cert_der.as_ref().to_vec()))
+        }
+    })
 }
 
 async fn send_peer_handshake(

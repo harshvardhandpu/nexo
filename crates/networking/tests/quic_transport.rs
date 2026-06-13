@@ -160,6 +160,55 @@ fn quic_transport_generates_events() {
     ));
 }
 
+#[test]
+fn restarted_listener_reuses_persisted_identity_and_address() {
+    // Reproduces the resume precondition: a receiver advertises a certificate and
+    // address, then "restarts". With a persisted identity bound to the same
+    // address, a sender that only ever learned the original certificate and
+    // address must still be able to reconnect after the restart.
+    let identity = QuicTransportProvider::generate_server_identity().expect("server identity");
+
+    let first_addr = {
+        let mut receiver =
+            QuicTransportProvider::localhost(peer_b()).expect("receiver QUIC provider");
+        let listener = receiver
+            .listen_with_identity(&identity)
+            .expect("first listener");
+        assert_eq!(
+            listener.certificate_der(),
+            identity.certificate_der.as_slice()
+        );
+        listener.local_addr()
+    };
+
+    // Rebind a brand-new provider to the same address using the same identity,
+    // exactly as a restarted `nexo receive` does.
+    let mut receiver = QuicTransportProvider::new(peer_b(), first_addr).expect("rebound provider");
+    let mut listener = receiver
+        .listen_with_identity(&identity)
+        .expect("rebound listener");
+    assert_eq!(listener.local_addr(), first_addr);
+    assert_eq!(
+        listener.certificate_der(),
+        identity.certificate_der.as_slice()
+    );
+
+    // The sender only ever trusted the original certificate and address.
+    let mut sender = QuicTransportProvider::localhost(peer_a()).expect("sender QUIC provider");
+    sender.register_peer(peer_b(), first_addr, identity.certificate_der.clone());
+    let sender_thread = std::thread::spawn(move || sender.connect(&peer_b(), session_id()));
+    let receiver_connection = listener
+        .accept()
+        .expect("receiver connection after restart");
+    let sender_connection = sender_thread
+        .join()
+        .expect("sender thread")
+        .expect("sender connection after restart");
+
+    assert_eq!(sender_connection.remote_peer(), &peer_b());
+    assert_eq!(receiver_connection.remote_peer(), &peer_a());
+}
+
 fn connected_pair() -> (QuicConnection, QuicConnection) {
     let (mut sender, mut listener) = quic_pair();
     let sender_thread = std::thread::spawn(move || sender.connect(&peer_b(), session_id()));

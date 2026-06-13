@@ -96,11 +96,20 @@ Files:
 ```text
 state.sqlite
 receiver.peer
+receiver.identity
 latest-transfer
 peer-id
 ```
 
 `state.sqlite` is managed through the storage crate. The CLI does not create its own persistence schema.
+
+`receiver.identity` stores the receiver's stable QUIC listening identity: the
+self-signed localhost certificate, its private key, and the bound port. It is
+written on the first `nexo receive` and reused on every subsequent run so a
+restarted receiver keeps the same address and certificate. This is what allows
+an interrupted sender to reconnect and resume against a previously advertised
+endpoint. The certificate generated here remains a localhost MVP bootstrap
+credential, not a production trust anchor.
 
 ---
 
@@ -166,7 +175,7 @@ When a transfer starts, the receiver loads any checkpoint for the transfer ID. T
 
 After metadata exchange, the receiver sends the reconciled missing chunk list. The sender skips verified chunks and sends only missing chunks. Both peers update storage-backed progress as chunks are received or sent, and `nexo status` reads the latest persisted session and resume metadata.
 
-The MVP does not implement automatic reconnect. Resume requires running `nexo receive` again and then running `nexo send` again for the same file.
+The MVP does not implement automatic reconnect within a single transfer. Resume requires running `nexo receive` again and then running `nexo send` again for the same file. Because the receiver now persists its listening identity in `receiver.identity`, a restarted receiver rebinds the same address and presents the same certificate, so a sender that pinned the original `--host` address (or re-reads the rewritten advertisement) can reconnect and continue from the receiver's checkpoint instead of failing to connect.
 
 ---
 

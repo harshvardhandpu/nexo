@@ -11,15 +11,16 @@ use engine::pipeline::{
     TransferPipelineReceiver, TransferPipelineSender, reconcile_checkpoint, transition_session,
 };
 use networking::{
-    LocalDiscoveryProvider, PeerAdvertisement, PeerDiscovery, PeerInfo, QuicTransportProvider,
-    TransportConnection, TransportListener, TransportProvider, TransportStream,
+    LocalDiscoveryProvider, PeerAdvertisement, PeerDiscovery, PeerInfo, QuicServerIdentity,
+    QuicTransportProvider, TransportConnection, TransportListener, TransportProvider,
+    TransportStream,
 };
 use rand_core::{OsRng, RngCore};
 use std::collections::HashSet;
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{Error as IoError, ErrorKind, Write};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use storage::{
@@ -30,6 +31,7 @@ use storage::{
 pub type CliResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const RECEIVER_PEER_FILE: &str = "receiver.peer";
+const RECEIVER_IDENTITY_FILE: &str = "receiver.identity";
 const LATEST_TRANSFER_FILE: &str = "latest-transfer";
 const STATE_DATABASE_FILE: &str = "state.sqlite";
 const PEER_ID_FILE: &str = "peer-id";
@@ -87,6 +89,10 @@ impl CliConfig {
 
     pub fn receiver_peer_path(&self) -> PathBuf {
         self.state_dir.join(RECEIVER_PEER_FILE)
+    }
+
+    pub fn receiver_identity_path(&self) -> PathBuf {
+        self.state_dir.join(RECEIVER_IDENTITY_FILE)
     }
 
     pub fn latest_transfer_path(&self) -> PathBuf {
@@ -254,8 +260,16 @@ pub fn run_receive<W: Write>(config: &CliConfig, output: &mut W) -> CliResult<()
     fs::create_dir_all(&config.receive_dir)?;
 
     let mut storage = storage(config)?;
-    let mut provider = QuicTransportProvider::localhost(receiver_peer())?;
-    let mut listener = provider.listen()?;
+    let (identity, stable_port) = load_or_create_receiver_identity(config)?;
+    let bind_addr = SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        stable_port.unwrap_or_default(),
+    );
+    let mut provider = QuicTransportProvider::new(receiver_peer(), bind_addr)?;
+    let mut listener = provider.listen_with_identity(&identity)?;
+    if stable_port.is_none() {
+        save_receiver_identity(config, &identity, listener.local_addr().port())?;
+    }
     let advert = ReceiverAdvert {
         address: listener.local_addr(),
         certificate_der: listener.certificate_der().to_vec(),
@@ -870,6 +884,46 @@ fn save_resume_state(
     Ok(())
 }
 
+fn load_or_create_receiver_identity(
+    config: &CliConfig,
+) -> CliResult<(QuicServerIdentity, Option<u16>)> {
+    let path = config.receiver_identity_path();
+    if path.exists() {
+        let contents = fs::read_to_string(path)?;
+        let certificate_der = hex_decode(read_field(&contents, "certificate")?)?;
+        let private_key_der = hex_decode(read_field(&contents, "private_key")?)?;
+        let port = read_field(&contents, "port")?
+            .parse::<u16>()
+            .map_err(|error| io_error(ErrorKind::InvalidData, format!("invalid port: {error}")))?;
+        return Ok((
+            QuicServerIdentity {
+                certificate_der,
+                private_key_der,
+            },
+            Some(port),
+        ));
+    }
+
+    Ok((QuicTransportProvider::generate_server_identity()?, None))
+}
+
+fn save_receiver_identity(
+    config: &CliConfig,
+    identity: &QuicServerIdentity,
+    port: u16,
+) -> CliResult<()> {
+    fs::write(
+        config.receiver_identity_path(),
+        format!(
+            "certificate={}\nprivate_key={}\nport={}\n",
+            hex_encode(&identity.certificate_der),
+            hex_encode(&identity.private_key_der),
+            port
+        ),
+    )?;
+    Ok(())
+}
+
 fn save_receiver_advert(config: &CliConfig, advert: &ReceiverAdvert) -> CliResult<()> {
     fs::write(
         config.receiver_peer_path(),
@@ -1335,6 +1389,214 @@ mod tests {
                 .expect("send utf8")
                 .contains("sending: 0/0 chunks, 0/0 bytes")
         );
+    }
+
+    #[test]
+    fn resume_after_real_interrupt_reconnects_and_skips_completed_chunks() {
+        // End-to-end reproduction of the real-world resume failure:
+        //   1. A real receiver accepts a transfer and persists checkpoints.
+        //   2. The sender is interrupted mid-transfer (connection dropped).
+        //   3. Both peers restart.
+        //   4. The sender, pinned to the receiver's ORIGINAL advertised address,
+        //      must reconnect and resume, sending only the chunks the receiver is
+        //      still missing.
+        //
+        // Before the fix, a restarted receiver bound a new random port with a new
+        // certificate, so the pinned sender could never reconnect and resume.
+        let workspace = TempWorkspace::new("quic-cli-interrupt-resume");
+        let source = workspace.path("source.bin");
+        let receive_dir = workspace.path("received");
+        let state_dir = workspace.path("state");
+        // 48 bytes / 8-byte chunks => 6 chunks.
+        let contents: Vec<u8> = (0..48u8).collect();
+        fs::create_dir_all(&receive_dir).expect("receive dir");
+        fs::write(&source, &contents).expect("source");
+        let config = CliConfig {
+            state_dir,
+            receive_dir: receive_dir.clone(),
+            chunk_size: 8,
+        };
+        let total_chunks = generate_manifest(&source, config.chunk_size)
+            .expect("manifest")
+            .total_chunks as usize;
+
+        // --- Run 1: partial transfer, then interrupt ---
+        let receive_config = config.clone();
+        let receiver = thread::spawn(move || {
+            let mut output = Vec::new();
+            run_receive(&receive_config, &mut output)
+        });
+        wait_for_receiver_advert(&config);
+        let advert_v1 = load_receiver_advert(&config).expect("advert v1");
+
+        let interrupted_at =
+            send_partial_then_drop(&source, advert_v1.address, &config, 2).expect("partial send");
+        assert!(
+            interrupted_at >= 1 && interrupted_at < total_chunks,
+            "expected a partial interrupt, got {interrupted_at}/{total_chunks}"
+        );
+        let run1 = receiver.join().expect("receiver thread");
+        assert!(
+            run1.is_err(),
+            "receiver should observe the interrupted connection as an error"
+        );
+
+        // The receiver must have persisted real checkpoint + resume state.
+        let persisted = {
+            let storage = storage(&config).expect("storage");
+            let transfer_id = TransferId(format!(
+                "transfer-{}",
+                generate_manifest(&source, config.chunk_size)
+                    .expect("manifest")
+                    .sha256
+            ));
+            let checkpoint = storage
+                .load_checkpoint(&transfer_id)
+                .expect("load checkpoint")
+                .expect("checkpoint persisted across interrupt");
+            assert!(
+                storage
+                    .load_resume_metadata(&transfer_id)
+                    .expect("load resume metadata")
+                    .is_some(),
+                "resume metadata must survive the interrupt"
+            );
+            checkpoint.completed_chunks.len()
+        };
+        assert!(
+            persisted >= 1 && persisted < total_chunks,
+            "expected {persisted} to be a partial checkpoint of {total_chunks}"
+        );
+
+        // --- Run 2: restart receiver and sender, expect resume ---
+        let receive_config = config.clone();
+        let receiver = thread::spawn(move || {
+            let mut output = Vec::new();
+            run_receive(&receive_config, &mut output)?;
+            String::from_utf8(output).map_err(|error| {
+                Box::new(IoError::new(ErrorKind::InvalidData, error))
+                    as Box<dyn Error + Send + Sync>
+            })
+        });
+        wait_for_receiver_advert(&config);
+        let advert_v2 = load_receiver_advert(&config).expect("advert v2");
+
+        // The restarted receiver must keep the same address and certificate, so
+        // the sender's previously learned endpoint stays valid.
+        assert_eq!(
+            advert_v2.address, advert_v1.address,
+            "restarted receiver must reuse its advertised address"
+        );
+        assert_eq!(
+            advert_v2.certificate_der, advert_v1.certificate_der,
+            "restarted receiver must reuse its certificate"
+        );
+
+        // Pin the sender to the ORIGINAL address (as `--host` would).
+        let mut send_output = Vec::new();
+        run_send(&source, Some(advert_v1.address), &config, &mut send_output)
+            .expect("resumed send reconnects");
+        let receive_output = receiver
+            .join()
+            .expect("receiver thread")
+            .expect("resumed receive");
+        let send_output = String::from_utf8(send_output).expect("send utf8");
+
+        // Final file matches the source byte-for-byte (SHA-256 verified by the
+        // receiver's verify_complete step before it reports completion).
+        assert_eq!(
+            fs::read(receive_dir.join("source.bin")).expect("received"),
+            contents
+        );
+        // The sender retransmitted ONLY the missing chunks, not the whole file.
+        let resent = send_output
+            .lines()
+            .filter(|line| line.starts_with("sent:"))
+            .count();
+        assert_eq!(
+            resent,
+            total_chunks - persisted,
+            "sender must resend only missing chunks"
+        );
+        assert!(resent < total_chunks, "resume must not resend everything");
+        assert!(receive_output.contains(&format!("receiving: {persisted}/{total_chunks} chunks")));
+
+        // Checkpoint persistence survived the restart and now reflects completion.
+        let storage = storage(&config).expect("storage");
+        let transfer_id = TransferId(format!(
+            "transfer-{}",
+            generate_manifest(&source, config.chunk_size)
+                .expect("manifest")
+                .sha256
+        ));
+        let checkpoint = storage
+            .load_checkpoint(&transfer_id)
+            .expect("load checkpoint")
+            .expect("checkpoint exists");
+        assert_eq!(checkpoint.completed_chunks.len(), total_chunks);
+    }
+
+    /// Drives a real transfer through the pipeline + QUIC + storage, but sends
+    /// only the first `limit` missing chunks before dropping the connection,
+    /// simulating an interrupted sender. Returns how many chunks were sent.
+    fn send_partial_then_drop(
+        source: &Path,
+        host: SocketAddr,
+        config: &CliConfig,
+        limit: usize,
+    ) -> CliResult<usize> {
+        let advert = load_receiver_advert(config)?;
+        let manifest = generate_manifest(source, config.chunk_size)?;
+        let transfer_id = TransferId(format!("transfer-{}", manifest.sha256));
+        let session_id = SessionId(format!("session-{}", transfer_id.0));
+        let sender = TransferPipelineSender::prepare(
+            source,
+            TransferPipelineConfig {
+                session_id: session_id.clone(),
+                transfer_id: transfer_id.clone(),
+                sender_peer: sender_peer(),
+                receiver_peer: receiver_peer(),
+                chunk_size: config.chunk_size,
+            },
+        )?;
+        let mut provider = QuicTransportProvider::localhost(sender_peer())?;
+        provider.register_peer(receiver_peer(), host, advert.certificate_der);
+        let mut connection = provider.connect(&receiver_peer(), session_id.clone())?;
+        let mut stream = connection.open_stream()?;
+        stream.send_message(sender.session_request_envelope())?;
+        for metadata in &sender.plan().chunks {
+            stream.send_message(metadata_envelope(
+                &session_id,
+                &transfer_id,
+                metadata.clone(),
+            ))?;
+        }
+        ensure_acceptance(&stream.receive_message()?)?;
+        let cipher = send_key_exchange(&mut stream, &session_id, &transfer_id)?;
+        let missing = missing_from_envelope(stream.receive_message()?, &transfer_id)?;
+
+        let mut sent = 0;
+        for chunk_id in missing.chunks.iter().take(limit) {
+            stream.send_message(sender.chunk_envelope(chunk_id, &cipher)?)?;
+            sent += 1;
+        }
+        stream.close()?;
+
+        // Keep the connection alive until the receiver has actually persisted at
+        // least one chunk, so the interrupted state on disk is deterministic.
+        // Tolerate transient SQLite contention with the receiver's writer.
+        let poll_storage = storage(config)?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Ok(Some(checkpoint)) = poll_storage.load_checkpoint(&transfer_id)
+                && !checkpoint.completed_chunks.is_empty()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        Ok(sent)
     }
 
     fn wait_for_receiver_advert(config: &CliConfig) {
