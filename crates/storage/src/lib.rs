@@ -5,6 +5,7 @@ use common::{
 use rusqlite::{Connection, OptionalExtension, params};
 use std::io::{Error, ErrorKind, Result};
 use std::path::Path;
+use std::time::Duration;
 
 const SCHEMA_VERSION: i64 = 1;
 
@@ -187,12 +188,42 @@ pub struct SqliteStorageBackend {
 impl SqliteStorageBackend {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let connection = Connection::open(path).map_err(sqlite_error)?;
+        Self::configure_connection(&connection)?;
         Ok(Self { connection })
     }
 
     pub fn in_memory() -> Result<Self> {
         let connection = Connection::open_in_memory().map_err(sqlite_error)?;
+        Self::configure_connection(&connection)?;
         Ok(Self { connection })
+    }
+
+    /// Configures a connection so that concurrent writers (for example the
+    /// sender and receiver processes sharing one state directory) do not crash
+    /// with "database is locked" during a large transfer.
+    ///
+    /// - WAL journaling lets a writer commit without blocking readers and keeps
+    ///   write transactions short, instead of taking a database-wide exclusive
+    ///   lock for the duration of every per-chunk checkpoint write.
+    /// - `synchronous = NORMAL` is the safe, fast pairing for WAL: commits no
+    ///   longer fsync the whole database, so the write lock is held briefly.
+    /// - An explicit busy timeout makes a momentarily blocked writer wait for
+    ///   the lock instead of failing immediately.
+    fn configure_connection(connection: &Connection) -> Result<()> {
+        connection
+            .busy_timeout(Duration::from_secs(30))
+            .map_err(sqlite_error)?;
+        // `PRAGMA journal_mode` returns the resulting mode, so read it back. A
+        // file database becomes "wal"; an in-memory database stays "memory".
+        connection
+            .query_row("PRAGMA journal_mode = WAL", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(sqlite_error)?;
+        connection
+            .pragma_update(None, "synchronous", "NORMAL")
+            .map_err(sqlite_error)?;
+        Ok(())
     }
 
     pub fn connection(&self) -> &Connection {
@@ -759,6 +790,83 @@ mod tests {
         fs::remove_file(path).ok();
     }
 
+    #[test]
+    fn open_configures_wal_and_busy_timeout() {
+        let path = temp_db_path("wal-config");
+        {
+            let storage = file_storage(&path);
+            let connection = storage.backend().connection();
+            let journal_mode: String = connection
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .expect("journal_mode");
+            let busy_timeout: i64 = connection
+                .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+                .expect("busy_timeout");
+
+            assert_eq!(journal_mode.to_lowercase(), "wal");
+            assert!(
+                busy_timeout >= 1000,
+                "busy_timeout must be configured, got {busy_timeout}"
+            );
+        }
+        remove_database(&path);
+    }
+
+    #[test]
+    fn concurrent_writers_on_shared_database_do_not_lock() {
+        // Reproduces the receiver crash during large transfers: the sender and
+        // receiver processes share one state directory, so two independent
+        // connections write per-chunk checkpoints to the same database file at
+        // the same time. Each per-chunk write rewrites a growing checkpoint
+        // (DELETE + N inserts) plus resume metadata, holding the write lock long
+        // enough that, without WAL journaling and a busy timeout, the loser of
+        // the lock race fails with "database is locked".
+        let path = temp_db_path("concurrent-writers");
+        let chunks_per_writer = 400u64;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let spawn_writer = |label: &'static str| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut storage = file_storage(&path);
+                let transfer_id = TransferId(format!("transfer-{label}"));
+                barrier.wait();
+                for chunk in 0..chunks_per_writer {
+                    let checkpoint = Checkpoint {
+                        transfer_id: transfer_id.clone(),
+                        completed_chunks: (0..=chunk).map(ChunkId).collect(),
+                    };
+                    storage
+                        .save_resume_metadata(&ResumeMetadata {
+                            transfer_id: transfer_id.clone(),
+                            manifest: FileManifest {
+                                name: format!("{label}.bin"),
+                                size: 4 * 1024 * 1024 * chunks_per_writer,
+                                chunk_size: 4 * 1024 * 1024,
+                                total_chunks: chunks_per_writer,
+                                sha256: "sha256".to_owned(),
+                            },
+                            checkpoint: checkpoint.clone(),
+                        })
+                        .unwrap_or_else(|error| panic!("writer {label} resume failed: {error}"));
+                    storage
+                        .save_checkpoint(&checkpoint)
+                        .unwrap_or_else(|error| {
+                            panic!("writer {label} checkpoint failed: {error}")
+                        });
+                }
+            })
+        };
+
+        let receiver = spawn_writer("receiver");
+        let sender = spawn_writer("sender");
+        receiver.join().expect("receiver writer thread");
+        sender.join().expect("sender writer thread");
+
+        remove_database(&path);
+    }
+
     fn sqlite_storage() -> Storage<SqliteStorageBackend> {
         Storage::new(SqliteStorageBackend::in_memory().expect("sqlite backend"))
             .expect("sqlite storage")
@@ -815,5 +923,15 @@ mod tests {
             "nexo-storage-{label}-{}-{unique}.sqlite",
             std::process::id()
         ))
+    }
+
+    fn remove_database(path: &Path) {
+        fs::remove_file(path).ok();
+        // WAL journaling leaves -wal/-shm sidecar files; remove them too.
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = path.as_os_str().to_owned();
+            sidecar.push(suffix);
+            fs::remove_file(std::path::PathBuf::from(sidecar)).ok();
+        }
     }
 }
