@@ -209,6 +209,54 @@ fn restarted_listener_reuses_persisted_identity_and_address() {
     assert_eq!(receiver_connection.remote_peer(), &peer_a());
 }
 
+#[test]
+fn transport_events_do_not_accumulate_without_draining() {
+    // Regression for the large-transfer OOM: the transfer path never drains
+    // connection events, and MessageSent/MessageReceived each retain a full
+    // chunk payload. With an unbounded event queue, moving N messages without
+    // draining retained N payloads (~N * chunk_size bytes), exhausting memory
+    // around chunk ~700 of a 5 GB transfer. The event buffer must stay bounded.
+    let (mut sender_connection, mut receiver_connection) = connected_pair();
+    let mut sender_stream = sender_connection.open_stream().expect("sender stream");
+    let mut receiver_stream = receiver_connection
+        .accept_stream()
+        .expect("receiver stream");
+
+    // Move far more messages than any reasonable event buffer, never draining
+    // events. Each must still send/receive correctly.
+    let total = 500u64;
+    for chunk_id in 0..total {
+        let envelope = chunk_envelope(chunk_id);
+        sender_stream
+            .send_message(envelope.clone())
+            .expect("send message");
+        let received = receiver_stream.receive_message().expect("receive message");
+        assert_eq!(received, envelope);
+    }
+
+    // Drain every event still buffered on each connection. A bounded buffer caps
+    // how many remain regardless of how many messages were moved; an unbounded
+    // buffer would have retained one event per message.
+    let drained = |connection: &mut QuicConnection| -> usize {
+        let mut count = 0;
+        while let Some(_event) = connection.try_next_event().expect("try_next_event") {
+            count += 1;
+        }
+        count
+    };
+    let sender_events = drained(&mut sender_connection);
+    let receiver_events = drained(&mut receiver_connection);
+
+    assert!(
+        sender_events < total as usize,
+        "sender retained {sender_events} events for {total} messages; queue is not bounded"
+    );
+    assert!(
+        receiver_events < total as usize,
+        "receiver retained {receiver_events} events for {total} messages; queue is not bounded"
+    );
+}
+
 fn connected_pair() -> (QuicConnection, QuicConnection) {
     let (mut sender, mut listener) = quic_pair();
     let sender_thread = std::thread::spawn(move || sender.connect(&peer_b(), session_id()));

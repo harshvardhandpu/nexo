@@ -15,6 +15,15 @@ use tokio::io::AsyncWriteExt;
 const LOCALHOST_SERVER_NAME: &str = "localhost";
 const STREAM_PREFACE: &[u8; 8] = b"NEXOQST1";
 const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
+/// Bound on the number of buffered transport events per connection.
+///
+/// Transport events are diagnostic. `MessageSent`/`MessageReceived` each carry a
+/// full `MessageEnvelope`, so for a chunked transfer they hold an entire chunk
+/// payload. The transfer path (CLI/engine) never drains these events, so an
+/// unbounded queue would retain every chunk ever moved and exhaust memory on a
+/// large transfer. With a bounded buffer, events are dropped once it is full
+/// instead of accumulating without limit.
+const EVENT_CHANNEL_CAPACITY: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct QuicPeerConfig {
@@ -209,7 +218,7 @@ impl TransportProvider for QuicTransportProvider {
             "quic-connecting-{}-{}-{}",
             self.local_peer.0, peer.0, session_id.0
         ));
-        let (event_tx, event_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::sync_channel(EVENT_CHANNEL_CAPACITY);
         send_event(
             &event_tx,
             TransportEvent::Connecting {
@@ -306,7 +315,7 @@ impl TransportListener for QuicListener {
         let (remote_peer, _session_id) = self
             .runtime
             .block_on(receive_peer_handshake(&connection, &connection_id))?;
-        let (event_tx, event_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::sync_channel(EVENT_CHANNEL_CAPACITY);
 
         send_event(
             &event_tx,
@@ -337,7 +346,7 @@ pub struct QuicConnection {
     endpoint: Endpoint,
     connection: quinn::Connection,
     runtime: Arc<tokio::runtime::Runtime>,
-    event_tx: mpsc::Sender<TransportEvent>,
+    event_tx: mpsc::SyncSender<TransportEvent>,
     event_rx: mpsc::Receiver<TransportEvent>,
     closed: bool,
 }
@@ -349,6 +358,21 @@ impl QuicConnection {
             .map_err(|error| TransportError::Protocol {
                 reason: format!("failed to read QUIC endpoint address: {error}"),
             })
+    }
+
+    /// Non-blocking variant of `next_event`, mirroring the loopback transport.
+    ///
+    /// Returns `Ok(None)` when no event is currently buffered. Because the event
+    /// buffer is bounded, the number of events this can ever return between an
+    /// idle period is capped, not proportional to the number of messages moved.
+    pub fn try_next_event(&mut self) -> Result<Option<TransportEvent>, TransportError> {
+        match self.event_rx.try_recv() {
+            Ok(event) => Ok(Some(event)),
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => Err(TransportError::ConnectionClosed {
+                connection_id: self.connection_id.clone(),
+            }),
+        }
     }
 
     fn ensure_open(&self) -> Result<(), TransportError> {
@@ -485,7 +509,7 @@ pub struct QuicStream {
     send: SendStream,
     recv: RecvStream,
     runtime: Arc<tokio::runtime::Runtime>,
-    event_tx: mpsc::Sender<TransportEvent>,
+    event_tx: mpsc::SyncSender<TransportEvent>,
     closed: bool,
 }
 
@@ -744,15 +768,19 @@ async fn read_frame(
 }
 
 fn send_event(
-    event_tx: &mpsc::Sender<TransportEvent>,
+    event_tx: &mpsc::SyncSender<TransportEvent>,
     event: TransportEvent,
-    connection_id: &ConnectionId,
+    _connection_id: &ConnectionId,
 ) -> Result<(), TransportError> {
-    event_tx
-        .send(event)
-        .map_err(|_| TransportError::ConnectionClosed {
-            connection_id: connection_id.clone(),
-        })
+    // Best-effort delivery: events are diagnostic and the transfer path never
+    // drains them. Dropping an event when the bounded buffer is full (or when no
+    // receiver remains) must never fail message I/O, and must never let undrained
+    // events accumulate unbounded memory.
+    match event_tx.try_send(event) {
+        Ok(()) | Err(mpsc::TrySendError::Full(_)) | Err(mpsc::TrySendError::Disconnected(_)) => {
+            Ok(())
+        }
+    }
 }
 
 fn quic_connection_id(connection: &quinn::Connection) -> ConnectionId {
