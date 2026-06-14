@@ -7,6 +7,7 @@ use networking::{
     QuicConnection, QuicListener, QuicTransportProvider, TransportConnection, TransportListener,
     TransportProvider, TransportStream,
 };
+use std::time::Duration;
 
 #[test]
 fn quic_transport_connects_over_localhost() {
@@ -254,6 +255,44 @@ fn transport_events_do_not_accumulate_without_draining() {
     assert!(
         receiver_events < total as usize,
         "receiver retained {receiver_events} events for {total} messages; queue is not bounded"
+    );
+}
+
+#[test]
+fn quic_transport_keeps_connection_alive_across_long_application_idle_gap() {
+    // Regression for large transfers: after the last chunk, the receiver may
+    // spend more than Quinn's default 30 second idle timeout verifying a large
+    // destination file before sending the final verification frame. The QUIC
+    // transport must keep the connection alive during that application-level
+    // quiet period so the next length-prefixed frame can still be exchanged.
+    let (mut sender_connection, mut receiver_connection) = connected_pair();
+    let mut sender_stream = sender_connection.open_stream().expect("sender stream");
+    let mut receiver_stream = receiver_connection
+        .accept_stream()
+        .expect("receiver stream");
+    let before_idle = chunk_envelope(1);
+    let after_idle = accepted_envelope();
+
+    sender_stream
+        .send_message(before_idle.clone())
+        .expect("send first message");
+    assert_eq!(
+        receiver_stream
+            .receive_message()
+            .expect("receive first message"),
+        before_idle
+    );
+
+    std::thread::sleep(Duration::from_secs(35));
+
+    receiver_stream
+        .send_message(after_idle.clone())
+        .expect("send after idle gap");
+    assert_eq!(
+        sender_stream
+            .receive_message()
+            .expect("receive after idle gap"),
+        after_idle
     );
 }
 

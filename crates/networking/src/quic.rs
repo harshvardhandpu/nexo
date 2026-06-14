@@ -6,15 +6,20 @@ use quinn::rustls::{
     RootCertStore,
     pki_types::{CertificateDer, PrivatePkcs8KeyDer},
 };
-use quinn::{ClientConfig, Endpoint, EndpointConfig, RecvStream, SendStream, ServerConfig};
+use quinn::{
+    ClientConfig, Endpoint, EndpointConfig, RecvStream, SendStream, ServerConfig, TransportConfig,
+};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::{Arc, mpsc};
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
 const LOCALHOST_SERVER_NAME: &str = "localhost";
 const STREAM_PREFACE: &[u8; 8] = b"NEXOQST1";
 const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
+const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// Bound on the number of buffered transport events per connection.
 ///
 /// Transport events are diagnostic. `MessageSent`/`MessageReceived` each carry a
@@ -163,12 +168,13 @@ impl QuicTransportProvider {
             .map_err(|error| TransportError::Protocol {
                 reason: format!("failed to trust QUIC peer certificate: {error}"),
             })?;
-        let client_config =
+        let mut client_config =
             ClientConfig::with_root_certificates(Arc::new(roots)).map_err(|error| {
                 TransportError::Protocol {
                     reason: format!("failed to configure QUIC client: {error}"),
                 }
             })?;
+        client_config.transport_config(quic_transport_config()?);
         let socket =
             UdpSocket::bind(self.bind_addr).map_err(|error| TransportError::ConnectionFailed {
                 connection_id: None,
@@ -619,11 +625,27 @@ fn server_config_from_identity(
 ) -> Result<ServerConfig, TransportError> {
     let cert_der = CertificateDer::from(identity.certificate_der.clone());
     let private_key = PrivatePkcs8KeyDer::from(identity.private_key_der.clone());
-    ServerConfig::with_single_cert(vec![cert_der], private_key.into()).map_err(|error| {
-        TransportError::Protocol {
-            reason: format!("failed to configure QUIC server certificate: {error}"),
-        }
-    })
+    let mut config =
+        ServerConfig::with_single_cert(vec![cert_der], private_key.into()).map_err(|error| {
+            TransportError::Protocol {
+                reason: format!("failed to configure QUIC server certificate: {error}"),
+            }
+        })?;
+    config.transport_config(quic_transport_config()?);
+    Ok(config)
+}
+
+fn quic_transport_config() -> Result<Arc<TransportConfig>, TransportError> {
+    let mut config = TransportConfig::default();
+    config
+        .max_idle_timeout(Some(MAX_IDLE_TIMEOUT.try_into().map_err(|error| {
+            TransportError::Protocol {
+                reason: format!("invalid QUIC idle timeout: {error}"),
+            }
+        })?))
+        .keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
+
+    Ok(Arc::new(config))
 }
 
 async fn send_peer_handshake(
