@@ -1,7 +1,7 @@
 use common::{
     Chunk, ChunkId, FileManifest, MessageEnvelope, PeerId, SessionId, TransferAcceptance,
-    TransferChunkMessage, TransferId, TransferMessage, TransferResponse, TransferSessionMessage,
-    TransportEvent,
+    TransferChunkMessage, TransferControlMessage, TransferId, TransferMessage, TransferResponse,
+    TransferSessionMessage, TransferVerificationMessage, TransportEvent,
 };
 use networking::{
     QuicConnection, QuicListener, QuicTransportProvider, QuicTransportTuning, TransportConnection,
@@ -378,6 +378,76 @@ fn quic_connection_survives_idle_gap_only_with_keep_alive() {
     );
 }
 
+#[test]
+fn finalize_handshake_survives_receiver_verification_longer_than_idle_timeout() {
+    // Faithful replay of Nexo's end-of-transfer finalize handshake, which is
+    // where 5 GB transfers died. In `run_receive` the receiver computes
+    // `verify_complete()` -> `sha256_file()` over the WHOLE output file and only
+    // THEN sends its `FileVerified` frame; meanwhile `run_send` is already parked
+    // in `receive_message()` awaiting that frame. For a 5 GB file the whole-file
+    // hash takes far longer than Quinn's 30s default idle timeout, and during it
+    // neither peer transmits application data -- so without keep-alive the
+    // connection idle-times-out and the FileVerified/Acknowledged exchange fails
+    // with "connection lost". The verification stall is modeled with a sleep that
+    // exceeds a short idle timeout so the proof is deterministic and sub-2s.
+    let tuning = QuicTransportTuning {
+        keep_alive_interval: Some(Duration::from_millis(120)),
+        max_idle_timeout: Duration::from_millis(600),
+    };
+    // Longer than the idle timeout: stands in for the multi-minute 5 GB hash.
+    let verification_stall = Duration::from_millis(1_800);
+
+    let (mut sender_connection, mut receiver_connection) = tuned_connected_pair(tuning);
+    let mut sender_stream = sender_connection.open_stream().expect("sender stream");
+    let mut receiver_stream = receiver_connection
+        .accept_stream()
+        .expect("receiver stream");
+
+    // Sender: stream the last chunks, then block awaiting FileVerified and ack --
+    // exactly the tail of `run_send`.
+    let sender_thread = std::thread::spawn(move || -> Result<MessageEnvelope, String> {
+        for chunk_id in 0..3 {
+            sender_stream
+                .send_message(chunk_envelope(chunk_id))
+                .map_err(|error| format!("send chunk {chunk_id}: {error}"))?;
+        }
+        let verified = sender_stream
+            .receive_message()
+            .map_err(|error| format!("receive verification: {error}"))?;
+        sender_stream
+            .send_message(acknowledged_envelope())
+            .map_err(|error| format!("send acknowledgement: {error}"))?;
+        Ok(verified)
+    });
+
+    // Receiver: drain the chunks, then "verify" (whole-file SHA-256) for longer
+    // than the idle timeout before sending FileVerified -- the tail of
+    // `run_receive`.
+    for chunk_id in 0..3 {
+        assert_eq!(
+            receiver_stream.receive_message().expect("receive chunk"),
+            chunk_envelope(chunk_id)
+        );
+    }
+    std::thread::sleep(verification_stall);
+    let verified = verified_envelope();
+    receiver_stream
+        .send_message(verified.clone())
+        .expect("send FileVerified after a verification longer than the idle timeout");
+    assert_eq!(
+        receiver_stream
+            .receive_message()
+            .expect("receive acknowledgement"),
+        acknowledged_envelope()
+    );
+
+    let delivered = sender_thread
+        .join()
+        .expect("sender thread")
+        .expect("finalize handshake completes across the verification stall");
+    assert_eq!(delivered, verified);
+}
+
 fn connected_pair() -> (QuicConnection, QuicConnection) {
     let (mut sender, mut listener) = quic_pair();
     let sender_thread = std::thread::spawn(move || sender.connect(&peer_b(), session_id()));
@@ -491,5 +561,25 @@ fn chunk_envelope(chunk_id: u64) -> MessageEnvelope {
             size: 4,
             data: format!("data{chunk_id}").into_bytes(),
         })),
+    }
+}
+
+fn verified_envelope() -> MessageEnvelope {
+    MessageEnvelope {
+        session_id: session_id(),
+        transfer_id: transfer_id(),
+        message: TransferMessage::Verification(TransferVerificationMessage::FileVerified {
+            transfer_id: transfer_id(),
+        }),
+    }
+}
+
+fn acknowledged_envelope() -> MessageEnvelope {
+    MessageEnvelope {
+        session_id: session_id(),
+        transfer_id: transfer_id(),
+        message: TransferMessage::Control(TransferControlMessage::Acknowledged {
+            transfer_id: transfer_id(),
+        }),
     }
 }
