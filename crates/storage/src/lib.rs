@@ -12,6 +12,30 @@ const SCHEMA_VERSION: i64 = 1;
 pub trait CheckpointStore {
     fn save_checkpoint(&mut self, checkpoint: &Checkpoint) -> Result<()>;
     fn load_checkpoint(&self, transfer_id: &TransferId) -> Result<Option<Checkpoint>>;
+
+    /// Records a single newly completed chunk without rewriting the rest of the
+    /// checkpoint. Idempotent: recording an already-recorded chunk is a no-op.
+    ///
+    /// This is the hot path during a transfer. The default implementation reads,
+    /// extends, and rewrites the whole checkpoint (O(N) per call, O(N^2) over a
+    /// transfer); backends should override it with an append-only write so
+    /// per-chunk cost stays O(1) regardless of how many chunks are already done.
+    fn append_completed_chunk(
+        &mut self,
+        transfer_id: &TransferId,
+        chunk_id: ChunkId,
+    ) -> Result<()> {
+        let mut checkpoint = self
+            .load_checkpoint(transfer_id)?
+            .unwrap_or_else(|| Checkpoint {
+                transfer_id: transfer_id.clone(),
+                completed_chunks: Vec::new(),
+            });
+        if !checkpoint.completed_chunks.contains(&chunk_id) {
+            checkpoint.completed_chunks.push(chunk_id);
+        }
+        self.save_checkpoint(&checkpoint)
+    }
 }
 
 pub trait SessionStore {
@@ -28,6 +52,27 @@ pub trait StorageBackend {
     fn migrate(&mut self) -> Result<()>;
     fn save_checkpoint_record(&mut self, record: &CheckpointRecord) -> Result<()>;
     fn load_checkpoint_record(&self, transfer_id: &TransferId) -> Result<Option<CheckpointRecord>>;
+
+    /// Appends a single completed chunk to a transfer's checkpoint.
+    ///
+    /// The default rewrites the full record (O(N)); backends that can do better
+    /// (the SQLite backend does) should override it with an O(1) upsert.
+    fn append_checkpoint_chunk_record(
+        &mut self,
+        transfer_id: &TransferId,
+        chunk_id: ChunkId,
+    ) -> Result<()> {
+        let mut record = self
+            .load_checkpoint_record(transfer_id)?
+            .unwrap_or_else(|| CheckpointRecord {
+                transfer_id: transfer_id.clone(),
+                completed_chunks: Vec::new(),
+            });
+        if !record.completed_chunks.contains(&chunk_id) {
+            record.completed_chunks.push(chunk_id);
+        }
+        self.save_checkpoint_record(&record)
+    }
     fn save_session_record(&mut self, record: &SessionRecord) -> Result<()>;
     fn load_session_record(&self, session_id: &SessionId) -> Result<Option<SessionRecord>>;
     fn save_resume_metadata_record(&mut self, record: &ResumeMetadataRecord) -> Result<()>;
@@ -67,6 +112,15 @@ impl<B: StorageBackend> CheckpointStore for Storage<B> {
         self.backend
             .load_checkpoint_record(transfer_id)
             .map(|record| record.map(Checkpoint::from))
+    }
+
+    fn append_completed_chunk(
+        &mut self,
+        transfer_id: &TransferId,
+        chunk_id: ChunkId,
+    ) -> Result<()> {
+        self.backend
+            .append_checkpoint_chunk_record(transfer_id, chunk_id)
     }
 }
 
@@ -368,6 +422,36 @@ impl StorageBackend for SqliteStorageBackend {
     fn save_checkpoint_record(&mut self, record: &CheckpointRecord) -> Result<()> {
         let transaction = self.connection.transaction().map_err(sqlite_error)?;
         Self::save_checkpoint_with_connection(&transaction, record)?;
+        transaction.commit().map_err(sqlite_error)
+    }
+
+    /// Append-only, O(1) per-chunk checkpoint update.
+    ///
+    /// Unlike [`Self::save_checkpoint_with_connection`], this touches only the
+    /// one new chunk: it upserts the parent `checkpoints` row (needed for the
+    /// foreign key on first use) and inserts the single chunk, both with
+    /// `INSERT OR IGNORE` so repeats are harmless. No `DELETE` + full reinsert,
+    /// so the per-chunk cost does not grow with the number of completed chunks.
+    fn append_checkpoint_chunk_record(
+        &mut self,
+        transfer_id: &TransferId,
+        chunk_id: ChunkId,
+    ) -> Result<()> {
+        let chunk_id = i64::try_from(chunk_id.0).map_err(integer_error)?;
+        let transaction = self.connection.transaction().map_err(sqlite_error)?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO checkpoints (transfer_id) VALUES (?1)",
+                params![transfer_id.0],
+            )
+            .map_err(sqlite_error)?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO checkpoint_chunks (transfer_id, chunk_id)
+                 VALUES (?1, ?2)",
+                params![transfer_id.0, chunk_id],
+            )
+            .map_err(sqlite_error)?;
         transaction.commit().map_err(sqlite_error)
     }
 
@@ -864,6 +948,125 @@ mod tests {
         receiver.join().expect("receiver writer thread");
         sender.join().expect("sender writer thread");
 
+        remove_database(&path);
+    }
+
+    #[test]
+    fn append_completed_chunk_accumulates_and_is_idempotent() {
+        let mut storage = sqlite_storage();
+        let transfer_id = TransferId("append-idempotent".to_owned());
+
+        // Out-of-order arrivals and duplicates (a resent chunk after reconnect)
+        // must collapse to a single sorted, deduplicated set.
+        for chunk in [0u64, 2, 1, 2, 0, 3] {
+            storage
+                .append_completed_chunk(&transfer_id, ChunkId(chunk))
+                .expect("append chunk");
+        }
+
+        let loaded = storage
+            .load_checkpoint(&transfer_id)
+            .expect("load checkpoint")
+            .expect("checkpoint exists");
+        assert_eq!(
+            loaded.completed_chunks,
+            vec![ChunkId(0), ChunkId(1), ChunkId(2), ChunkId(3)]
+        );
+    }
+
+    #[test]
+    fn append_completed_chunk_survives_repeated_restart_cycles() {
+        // Models kill -9 + resume, repeated: persist a batch of chunks, "crash"
+        // (drop the connection), reopen, and keep appending. State must
+        // accumulate exactly across many cycles, with re-sent chunks staying
+        // idempotent -- no loss, no duplication, no corruption.
+        let path = temp_db_path("append-restart-cycles");
+        let transfer_id = TransferId("restart".to_owned());
+        let cycles = 20u64;
+        let per_cycle = 25u64;
+
+        for cycle in 0..cycles {
+            let mut storage = file_storage(&path);
+            for offset in 0..per_cycle {
+                let chunk = cycle * per_cycle + offset;
+                storage
+                    .append_completed_chunk(&transfer_id, ChunkId(chunk))
+                    .expect("append across restart");
+            }
+            // A chunk already durable before this "crash" is re-sent on resume.
+            storage
+                .append_completed_chunk(&transfer_id, ChunkId(cycle * per_cycle))
+                .expect("re-append after restart");
+            // `storage` drops here: connection closed == simulated crash.
+        }
+
+        let storage = file_storage(&path);
+        let loaded = storage
+            .load_checkpoint(&transfer_id)
+            .expect("load checkpoint")
+            .expect("checkpoint exists");
+        let expected: Vec<ChunkId> = (0..cycles * per_cycle).map(ChunkId).collect();
+        assert_eq!(loaded.completed_chunks, expected);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn incremental_checkpoint_writes_stay_linear_over_a_long_run() {
+        // Performance guardrail for large / long transfers: appending N chunks
+        // one at a time must do O(N) total row writes, not the O(N^2) of a
+        // DELETE + full reinsert per chunk. Measured with real row changes via
+        // total_changes().
+        let path = temp_db_path("append-linear");
+        let mut storage = file_storage(&path);
+        let transfer_id = TransferId("linear".to_owned());
+        let n = 2_000u64;
+
+        let baseline = storage.backend().connection().total_changes();
+        for chunk in 0..n {
+            storage
+                .append_completed_chunk(&transfer_id, ChunkId(chunk))
+                .expect("append chunk");
+        }
+        let changes = storage.backend().connection().total_changes() - baseline;
+
+        // O(1) per chunk => ~ n (+1 parent row) changes. A per-chunk full
+        // rewrite would be ~ n^2 / 2 (two million for n=2000). Firmly linear.
+        assert!(
+            changes <= 2 * n,
+            "checkpoint writes are not O(1) per chunk: {changes} row changes for {n} chunks"
+        );
+
+        let loaded = storage
+            .load_checkpoint(&transfer_id)
+            .expect("load checkpoint")
+            .expect("checkpoint exists");
+        assert_eq!(loaded.completed_chunks.len(), n as usize);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn appending_to_a_large_checkpoint_does_not_rewrite_the_table() {
+        // The crisp "no full table rewrite per chunk" proof: with 1000 chunks
+        // already recorded, adding one more must change ~1 row, not ~2000.
+        let path = temp_db_path("append-no-rewrite");
+        let mut storage = file_storage(&path);
+        let transfer_id = TransferId("no-rewrite".to_owned());
+        for chunk in 0..1_000u64 {
+            storage
+                .append_completed_chunk(&transfer_id, ChunkId(chunk))
+                .expect("seed checkpoint");
+        }
+
+        let before = storage.backend().connection().total_changes();
+        storage
+            .append_completed_chunk(&transfer_id, ChunkId(1_000))
+            .expect("append one more chunk");
+        let cost = storage.backend().connection().total_changes() - before;
+
+        assert!(
+            cost <= 2,
+            "adding one chunk to a 1000-chunk checkpoint changed {cost} rows; the table is being rewritten"
+        );
         remove_database(&path);
     }
 

@@ -325,9 +325,15 @@ pub fn run_receive<W: Write>(config: &CliConfig, output: &mut W) -> CliResult<()
 
     while receiver.checkpoint().completed_chunks.len() < request.manifest.total_chunks as usize {
         let envelope = stream.receive_message()?;
+        let completed_id = data_chunk_id(&envelope);
         checkpoint = receiver.receive_chunk(envelope, &cipher)?;
-        storage.save_checkpoint(&checkpoint)?;
-        save_resume_state(&mut storage, &request, checkpoint.clone())?;
+        // Persist only the one chunk just written (O(1)); the manifest/resume
+        // metadata were saved once before the loop and `load_resume_metadata`
+        // reads the checkpoint live from `checkpoint_chunks`, so incremental
+        // appends keep the resume state fully current without rewriting it.
+        if let Some(chunk_id) = completed_id {
+            storage.append_completed_chunk(&request.transfer_id, chunk_id)?;
+        }
         storage.save_session(receiver.session())?;
         print_progress("received", &checkpoint, &metadata, &request, output)?;
     }
@@ -424,19 +430,15 @@ pub fn run_send<W: Write>(
     for chunk_id in &missing.chunks {
         let envelope = sender.chunk_envelope(chunk_id, &cipher)?;
         stream.send_message(envelope)?;
+        // Persist just this chunk (O(1)); resume metadata was written once above.
+        storage.append_completed_chunk(&transfer_id, chunk_id.clone())?;
         if !progress_checkpoint
             .completed_chunks
             .iter()
             .any(|completed| completed == chunk_id)
         {
             progress_checkpoint.completed_chunks.push(chunk_id.clone());
-            progress_checkpoint
-                .completed_chunks
-                .sort_by_key(|completed| completed.0);
         }
-        storage.save_checkpoint(&progress_checkpoint)?;
-        storage
-            .save_resume_metadata(&sender.plan().resume_metadata(progress_checkpoint.clone()))?;
         print_progress(
             "sent",
             &progress_checkpoint,
@@ -673,6 +675,15 @@ fn request_from_envelope(envelope: &MessageEnvelope) -> CliResult<TransferReques
             ErrorKind::InvalidData,
             "expected transfer request",
         )),
+    }
+}
+
+/// Chunk id carried by a chunk-data envelope, if any. Used to persist exactly
+/// the chunk just received without inspecting the full checkpoint.
+fn data_chunk_id(envelope: &MessageEnvelope) -> Option<ChunkId> {
+    match &envelope.message {
+        TransferMessage::Chunk(TransferChunkMessage::Data(chunk)) => Some(chunk.id.clone()),
+        _ => None,
     }
 }
 
