@@ -5,7 +5,8 @@
     "module": "ESNext",
     "moduleResolution": "Node",
     "allowSyntheticDefaultImports": true,
-    "noEmit": true,
+    "emitDeclarationOnly": true,
+    "outDir": "./.tsbuild-node",
     "types": ["node"]
   },
   "include": ["vite.config.ts"]

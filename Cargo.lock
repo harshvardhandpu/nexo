@@ -531,6 +531,7 @@ dependencies = [
  "crypto",
  "engine",
  "hostname",
+ "if-addrs",
  "networking",
  "rand_core 0.6.4",
  "storage",

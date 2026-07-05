@@ -1,0 +1,323 @@
+/*
+ * Nexo Desktop — "Midnight Flow" theme.
+ *
+ * Design tokens, base layer, and the animation keyframes shared across the app.
+ * Dark futuristic surface, glassmorphism panels, cyan -> purple neon accents.
+ * No animation library: every motion below is pure CSS so the app builds with
+ * only the packages already in package.json.
+ */
+
+:root {
+  /* Surfaces (deep midnight -> raised glass) */
+  --bg-void: #05070f;
+  --bg-base: #080b16;
+  --bg-raised: #0d1120;
+  --glass: rgba(146, 170, 255, 0.05);
+  --glass-strong: rgba(146, 170, 255, 0.09);
+  --glass-border: rgba(160, 180, 255, 0.12);
+  --glass-border-strong: rgba(160, 180, 255, 0.22);
+
+  /* Neon accents */
+  --cyan: #22d3ee;
+  --cyan-soft: #5eead4;
+  --purple: #a855f7;
+  --purple-soft: #c084fc;
+  --blue: #3b82f6;
+  --accent-grad: linear-gradient(120deg, var(--cyan) 0%, var(--blue) 45%, var(--purple) 100%);
+  --accent-grad-soft: linear-gradient(120deg, rgba(34, 211, 238, 0.18), rgba(168, 85, 247, 0.18));
+
+  /* Semantic */
+  --success: #34d399;
+  --success-glow: rgba(52, 211, 153, 0.55);
+  --danger: #fb5b6d;
+  --danger-glow: rgba(251, 91, 109, 0.5);
+  --warning: #fbbf24;
+
+  /* Text */
+  --text: #eaf0ff;
+  --text-muted: #9aa6c8;
+  --text-faint: #64708f;
+
+  /* Geometry */
+  --radius-sm: 10px;
+  --radius: 16px;
+  --radius-lg: 22px;
+  --radius-pill: 999px;
+
+  /* Shadows / glow */
+  --shadow-panel: 0 24px 60px -30px rgba(0, 0, 0, 0.9), 0 1px 0 0 rgba(255, 255, 255, 0.04) inset;
+  --glow-cyan: 0 0 24px -4px rgba(34, 211, 238, 0.55);
+  --glow-purple: 0 0 26px -4px rgba(168, 85, 247, 0.55);
+
+  /* Motion */
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --dur-fast: 160ms;
+  --dur: 280ms;
+  --dur-slow: 520ms;
+
+  --font: "Inter", "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", "SFMono-Regular", ui-monospace, "Cascadia Code", monospace;
+
+  --sidebar-w: 244px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--font);
+  color: var(--text);
+  background: var(--bg-void);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow: hidden;
+}
+
+/* Animated aurora backdrop --------------------------------------------------*/
+#root {
+  position: relative;
+  isolation: isolate;
+}
+
+#root::before,
+#root::after {
+  content: "";
+  position: fixed;
+  inset: -20% -10%;
+  z-index: -2;
+  pointer-events: none;
+  filter: blur(90px);
+  opacity: 0.6;
+}
+
+#root::before {
+  background:
+    radial-gradient(42% 40% at 18% 22%, rgba(34, 211, 238, 0.28), transparent 60%),
+    radial-gradient(46% 44% at 82% 18%, rgba(168, 85, 247, 0.26), transparent 62%),
+    radial-gradient(50% 50% at 60% 92%, rgba(59, 130, 246, 0.22), transparent 65%);
+  animation: aurora-drift 22s var(--ease-in-out) infinite alternate;
+}
+
+#root::after {
+  background: radial-gradient(60% 60% at 50% 0%, rgba(120, 150, 255, 0.08), transparent 70%);
+}
+
+@keyframes aurora-drift {
+  0% {
+    transform: translate3d(-3%, -2%, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(4%, 3%, 0) scale(1.08);
+  }
+  100% {
+    transform: translate3d(-2%, 4%, 0) scale(1.03);
+  }
+}
+
+/* Typography ---------------------------------------------------------------*/
+h1,
+h2,
+h3,
+h4 {
+  margin: 0;
+  font-weight: 650;
+  letter-spacing: -0.015em;
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.text-muted {
+  color: var(--text-muted);
+}
+.text-faint {
+  color: var(--text-faint);
+}
+
+.gradient-text {
+  background: var(--accent-grad);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+::selection {
+  background: rgba(34, 211, 238, 0.3);
+}
+
+/* Scrollbar ----------------------------------------------------------------*/
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(160, 180, 255, 0.16);
+  border-radius: var(--radius-pill);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(160, 180, 255, 0.3);
+  background-clip: padding-box;
+}
+
+/* ==========================================================================
+ * Animation keyframes (referenced by components)
+ * ==========================================================================*/
+
+/* Page transition: fade + slide */
+@keyframes page-enter {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.994);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* Liquid progress flow */
+@keyframes liquid-flow {
+  0% {
+    background-position: 0% 50%;
+  }
+  100% {
+    background-position: 200% 50%;
+  }
+}
+
+@keyframes liquid-wave {
+  0% {
+    transform: translateX(-50%) translateY(0);
+  }
+  50% {
+    transform: translateX(-25%) translateY(-2px);
+  }
+  100% {
+    transform: translateX(0%) translateY(0);
+  }
+}
+
+/* Success glow burst */
+@keyframes glow-burst {
+  0% {
+    box-shadow: 0 0 0 0 var(--success-glow);
+    transform: scale(0.9);
+    opacity: 0;
+  }
+  40% {
+    opacity: 1;
+  }
+  100% {
+    box-shadow: 0 0 0 26px rgba(52, 211, 153, 0);
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+@keyframes burst-ring {
+  from {
+    transform: scale(0.4);
+    opacity: 0.9;
+  }
+  to {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+}
+
+/* Error shake + red pulse */
+@keyframes shake {
+  10%,
+  90% {
+    transform: translateX(-1px);
+  }
+  20%,
+  80% {
+    transform: translateX(2px);
+  }
+  30%,
+  50%,
+  70% {
+    transform: translateX(-5px);
+  }
+  40%,
+  60% {
+    transform: translateX(5px);
+  }
+}
+
+@keyframes red-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(251, 91, 109, 0);
+  }
+  30% {
+    box-shadow: 0 0 0 4px rgba(251, 91, 109, 0.28);
+  }
+}
+
+/* Connection node glow */
+@keyframes node-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.25);
+  }
+}
+
+@keyframes edge-dash {
+  to {
+    stroke-dashoffset: -24;
+  }
+}
+
+/* Ambient shimmer for skeletons/idle */
+@keyframes shimmer {
+  to {
+    background-position: 200% 0;
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

@@ -4,7 +4,7 @@
 
 The QUIC transport MVP is the first real networking implementation behind the existing transport contracts.
 
-It provides localhost QUIC communication for:
+It provides QUIC communication for local and LAN endpoints for:
 
 * opening and accepting connections
 * opening and accepting bidirectional streams
@@ -47,7 +47,7 @@ The provider does not discover peers. Callers must register a peer's socket addr
 
 ### QuicListener
 
-Owns a server-side Quinn endpoint bound to a localhost socket.
+Owns a server-side Quinn endpoint bound to a caller-provided socket address.
 
 It exposes:
 
@@ -156,7 +156,7 @@ QUIC uses TLS 1.3 through Quinn and Rustls.
 
 For this MVP:
 
-* listeners generate self-signed localhost certificates
+* listeners generate self-signed MVP bootstrap certificates
 * clients trust a peer only when the caller explicitly registers that peer's certificate
 * certificate trust is sufficient for localhost integration tests and early local development
 * long-term identity, pairing, certificate pinning policy, and user-visible trust decisions are future work
@@ -167,7 +167,7 @@ The QUIC transport secures the transport channel. End-to-end transfer payload en
 
 ## Future NAT Traversal Compatibility
 
-This MVP intentionally uses explicit socket addresses and localhost binding.
+This MVP intentionally uses explicit socket addresses and direct binding.
 
 Future discovery or NAT traversal layers can populate the same peer registration boundary with externally learned addresses and trusted peer credentials. The QUIC transport should remain focused on:
 

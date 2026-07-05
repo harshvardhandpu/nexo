@@ -16,7 +16,9 @@
         "width": 1180,
         "height": 760,
         "minWidth": 940,
-        "minHeight": 620
+        "minHeight": 620,
+        "theme": "Dark",
+        "dragDropEnabled": true
       }
     ],
     "security": {
@@ -24,8 +26,16 @@
     }
   },
   "bundle": {
-    "active": false,
-    "targets": "all",
-    "icon": []
+    "active": true,
+    "targets": ["appimage", "deb"],
+    "category": "Utility",
+    "shortDescription": "Encrypted, resumable QUIC file transfer",
+    "longDescription": "Nexo moves large files over encrypted QUIC with chunk-level integrity and crash-safe resume, wrapped in a modern animated desktop interface.",
+    "icon": ["icons/icon.png"],
+    "linux": {
+      "deb": {
+        "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0"]
+      }
+    }
   }
 }

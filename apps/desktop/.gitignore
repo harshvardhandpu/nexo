@@ -2,6 +2,7 @@ node_modules/
 dist/
 .vite/
 *.tsbuildinfo
+.tsbuild-node/
 vite.config.d.ts
 vite.config.js
 

@@ -9,7 +9,7 @@ It connects:
 * transfer pipeline chunking, verification, and resume decisions
 * storage checkpoints, sessions, and resume metadata
 * crypto session primitives for chunk payload encryption
-* QUIC localhost transport for real networking
+* QUIC LAN-capable transport for real networking
 * local peer discovery for LAN visibility
 
 It does not implement GUI, Tauri, NAT traversal, relay networking, delta transfers, folder synchronization, mesh networking, multipath transfer, or production pairing.
@@ -40,14 +40,14 @@ This identity is used only for local discovery. It is not an authentication cred
 
 ### nexo receive
 
-Starts a QUIC listener on localhost, writes a local receiver advertisement into the CLI state directory, accepts one incoming transfer, writes the received file into the current directory, persists checkpoints as chunks arrive, verifies the completed file, and exits.
+Starts a QUIC listener on all IPv4 interfaces, writes a receiver advertisement into the CLI state directory using a reachable LAN address when one is available, accepts one incoming transfer, writes the received file into the current directory, persists checkpoints as chunks arrive, verifies the completed file, and exits.
 
 The receiver advertisement contains:
 
 * listener socket address
-* generated localhost certificate
+* generated receiver certificate
 
-This is a localhost MVP bootstrap mechanism. It is not peer discovery and is not a production trust model.
+This is an MVP bootstrap mechanism for local and LAN transfers. It is not peer discovery and is not a production trust model.
 
 ### nexo send <file>
 
@@ -104,11 +104,11 @@ peer-id
 `state.sqlite` is managed through the storage crate. The CLI does not create its own persistence schema.
 
 `receiver.identity` stores the receiver's stable QUIC listening identity: the
-self-signed localhost certificate, its private key, and the bound port. It is
+self-signed receiver certificate, its private key, and the bound port. It is
 written on the first `nexo receive` and reused on every subsequent run so a
 restarted receiver keeps the same address and certificate. This is what allows
 an interrupted sender to reconnect and resume against a previously advertised
-endpoint. The certificate generated here remains a localhost MVP bootstrap
+endpoint. The certificate generated here remains an MVP bootstrap
 credential, not a production trust anchor.
 
 ---
@@ -188,7 +188,7 @@ The CLI uses two layers:
 
 For MVP bootstrapping:
 
-* receiver certificates are self-signed localhost certificates
+* receiver certificates are self-signed MVP bootstrap certificates
 * sender trust comes from the locally stored receiver advertisement
 * discovery identities are informational and do not authenticate a transfer peer
 * long-term identity, pairing UX, certificate rotation, and authenticated device trust are future work

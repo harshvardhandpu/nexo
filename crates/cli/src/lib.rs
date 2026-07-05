@@ -261,17 +261,15 @@ pub fn run_receive<W: Write>(config: &CliConfig, output: &mut W) -> CliResult<()
 
     let mut storage = storage(config)?;
     let (identity, stable_port) = load_or_create_receiver_identity(config)?;
-    let bind_addr = SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::LOCALHOST),
-        stable_port.unwrap_or_default(),
-    );
+    let bind_addr = receiver_bind_addr(stable_port);
     let mut provider = QuicTransportProvider::new(receiver_peer(), bind_addr)?;
     let mut listener = provider.listen_with_identity(&identity)?;
     if stable_port.is_none() {
         save_receiver_identity(config, &identity, listener.local_addr().port())?;
     }
+    let advertised_addr = receiver_advertised_addr(listener.local_addr())?;
     let advert = ReceiverAdvert {
-        address: listener.local_addr(),
+        address: advertised_addr,
         certificate_der: listener.certificate_der().to_vec(),
     };
     save_receiver_advert(config, &advert)?;
@@ -555,6 +553,51 @@ struct ReceiverAdvert {
 struct LatestTransfer {
     transfer_id: TransferId,
     session_id: SessionId,
+}
+
+fn receiver_bind_addr(stable_port: Option<u16>) -> SocketAddr {
+    SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        stable_port.unwrap_or_default(),
+    )
+}
+
+fn receiver_advertised_addr(bound_addr: SocketAddr) -> CliResult<SocketAddr> {
+    Ok(receiver_advertised_addr_with_lan(
+        bound_addr,
+        preferred_lan_ipv4()?,
+    ))
+}
+
+fn receiver_advertised_addr_with_lan(
+    bound_addr: SocketAddr,
+    lan_address: Option<Ipv4Addr>,
+) -> SocketAddr {
+    let address = lan_address.unwrap_or(Ipv4Addr::LOCALHOST);
+    SocketAddr::new(IpAddr::V4(address), bound_addr.port())
+}
+
+fn preferred_lan_ipv4() -> CliResult<Option<Ipv4Addr>> {
+    let interfaces = if_addrs::get_if_addrs()?;
+    Ok(interfaces.into_iter().find_map(|interface| {
+        if !interface.is_oper_up() || interface.is_loopback() || interface.is_p2p() {
+            return None;
+        }
+
+        match interface.ip() {
+            IpAddr::V4(address) if is_lan_advertisable_ipv4(address) => Some(address),
+            _ => None,
+        }
+    }))
+}
+
+fn is_lan_advertisable_ipv4(address: Ipv4Addr) -> bool {
+    !(address.is_unspecified()
+        || address.is_loopback()
+        || address.is_link_local()
+        || address.is_broadcast()
+        || address.is_multicast()
+        || address.is_documentation())
 }
 
 struct CliChunkCipher {
@@ -1192,6 +1235,57 @@ mod tests {
                 address: "127.0.0.1:41000".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn receiver_binds_all_ipv4_interfaces_for_lan_reachability() {
+        assert_eq!(
+            receiver_bind_addr(None),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+        );
+        assert_eq!(
+            receiver_bind_addr(Some(41000)),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 41000)
+        );
+    }
+
+    #[test]
+    fn receiver_advertisement_uses_lan_address_with_bound_port() {
+        let bound = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 41000);
+
+        let advertised =
+            receiver_advertised_addr_with_lan(bound, Some(Ipv4Addr::new(192, 168, 1, 44)));
+
+        assert_eq!(
+            advertised,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 44)), 41000)
+        );
+    }
+
+    #[test]
+    fn receiver_advertisement_falls_back_to_loopback_when_no_lan_address_exists() {
+        let bound = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 41000);
+
+        let advertised = receiver_advertised_addr_with_lan(bound, None);
+
+        assert_eq!(
+            advertised,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 41000)
+        );
+    }
+
+    #[test]
+    fn lan_advertisement_rejects_non_reachable_ipv4_addresses() {
+        assert!(is_lan_advertisable_ipv4(Ipv4Addr::new(10, 0, 0, 10)));
+        assert!(is_lan_advertisable_ipv4(Ipv4Addr::new(172, 16, 0, 10)));
+        assert!(is_lan_advertisable_ipv4(Ipv4Addr::new(192, 168, 1, 10)));
+
+        assert!(!is_lan_advertisable_ipv4(Ipv4Addr::UNSPECIFIED));
+        assert!(!is_lan_advertisable_ipv4(Ipv4Addr::LOCALHOST));
+        assert!(!is_lan_advertisable_ipv4(Ipv4Addr::new(169, 254, 1, 10)));
+        assert!(!is_lan_advertisable_ipv4(Ipv4Addr::BROADCAST));
+        assert!(!is_lan_advertisable_ipv4(Ipv4Addr::new(224, 0, 0, 1)));
+        assert!(!is_lan_advertisable_ipv4(Ipv4Addr::new(192, 0, 2, 1)));
     }
 
     #[test]

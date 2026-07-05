@@ -56,6 +56,29 @@ export type StartJobResponse = {
   jobId: number;
 };
 
+export type StressRunState = "running" | "completed" | "failed";
+
+export type StressIteration = {
+  index: number;
+  state: TransferJobState;
+  error: string | null;
+};
+
+export type StressRun = {
+  runId: number;
+  filePath: string;
+  targetIterations: number;
+  completed: number;
+  failed: number;
+  state: StressRunState;
+  iterations: StressIteration[];
+  lastOutput: string[];
+};
+
+export type StartStressResponse = {
+  runId: number;
+};
+
 export function getSettings() {
   return invoke<DesktopSettings>("get_settings");
 }
@@ -93,4 +116,24 @@ export function listTransferJobs() {
 
 export function resetCompletedJobs() {
   return invoke<void>("reset_completed_jobs");
+}
+
+export function startStressRun(
+  filePath: string,
+  iterations: number,
+  host?: string,
+) {
+  return invoke<StartStressResponse>("start_stress_run", {
+    filePath,
+    host: host || null,
+    iterations,
+  });
+}
+
+export function listStressRuns() {
+  return invoke<StressRun[]>("list_stress_runs");
+}
+
+export function resetCompletedStressRuns() {
+  return invoke<void>("reset_completed_stress_runs");
 }

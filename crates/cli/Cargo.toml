@@ -13,6 +13,7 @@ common = { path = "../common" }
 crypto = { path = "../crypto" }
 engine = { path = "../engine" }
 hostname = "0.4"
+if-addrs = "0.15"
 networking = { path = "../networking" }
 rand_core = { version = "0.6", features = ["getrandom"] }
 storage = { path = "../storage" }
