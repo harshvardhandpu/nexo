@@ -18,8 +18,22 @@ use tokio::io::AsyncWriteExt;
 const LOCALHOST_SERVER_NAME: &str = "localhost";
 const STREAM_PREFACE: &[u8; 8] = b"NEXOQST1";
 const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
-const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+/// How long a QUIC connection may receive no packets before it is torn down as
+/// lost. Quinn's own default is 30s; a large transfer's silent gaps (most
+/// notably the receiver's end-of-transfer whole-file SHA-256 verification, which
+/// scales with file size) exceed that, so we raise it and pair it with a
+/// keep-alive that stays well below it.
+const DEFAULT_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// How often an otherwise-idle QUIC connection emits a keep-alive PING.
+///
+/// During a transfer the application does long synchronous CPU/IO work between
+/// network operations and puts *no* packets on the wire. Quinn disables
+/// keep-alive by default, so without this a large transfer eventually dies
+/// mid-flight with "connection lost" (an idle timeout). Quinn's connection
+/// driver emits these PINGs on the runtime worker threads even while the
+/// transfer thread is blocked in hashing or storage writes, keeping the
+/// connection warm across those gaps.
+const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// Bound on the number of buffered transport events per connection.
 ///
 /// Transport events are diagnostic. `MessageSent`/`MessageReceived` each carry a
@@ -50,12 +64,40 @@ pub struct QuicServerIdentity {
     pub private_key_der: Vec<u8>,
 }
 
+/// Tunable QUIC connection-liveness parameters.
+///
+/// These govern whether a connection survives long application-layer stalls in
+/// which neither peer transmits (see [`DEFAULT_KEEP_ALIVE_INTERVAL`]). The
+/// defaults are correct for real transfers; the knobs exist so tests can drive
+/// the idle-timeout behavior deterministically without waiting for the
+/// production timeouts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuicTransportTuning {
+    /// How often an otherwise-idle connection emits a keep-alive PING. `None`
+    /// disables keep-alive (Quinn's own default), which lets a connection die
+    /// during a silent gap longer than `max_idle_timeout`.
+    pub keep_alive_interval: Option<Duration>,
+    /// How long a connection may receive no packets before it is torn down as
+    /// lost.
+    pub max_idle_timeout: Duration,
+}
+
+impl Default for QuicTransportTuning {
+    fn default() -> Self {
+        Self {
+            keep_alive_interval: Some(DEFAULT_KEEP_ALIVE_INTERVAL),
+            max_idle_timeout: DEFAULT_MAX_IDLE_TIMEOUT,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct QuicTransportProvider {
     local_peer: PeerId,
     bind_addr: SocketAddr,
     runtime: Arc<tokio::runtime::Runtime>,
     peers: HashMap<PeerId, QuicPeerConfig>,
+    tuning: QuicTransportTuning,
 }
 
 impl QuicTransportProvider {
@@ -65,7 +107,15 @@ impl QuicTransportProvider {
             bind_addr,
             runtime: new_runtime()?,
             peers: HashMap::new(),
+            tuning: QuicTransportTuning::default(),
         })
+    }
+
+    /// Overrides the connection-liveness tuning for every endpoint this provider
+    /// creates. Defaults to [`QuicTransportTuning::default`].
+    pub fn set_transport_tuning(&mut self, tuning: QuicTransportTuning) -> &mut Self {
+        self.tuning = tuning;
+        self
     }
 
     pub fn localhost(local_peer: PeerId) -> Result<Self, TransportError> {
@@ -119,7 +169,7 @@ impl QuicTransportProvider {
         &mut self,
         identity: &QuicServerIdentity,
     ) -> Result<QuicListener, TransportError> {
-        let server_config = server_config_from_identity(identity)?;
+        let server_config = server_config_from_identity(identity, self.tuning)?;
         self.bind_listener(server_config, identity.certificate_der.clone())
     }
 
@@ -174,7 +224,7 @@ impl QuicTransportProvider {
                     reason: format!("failed to configure QUIC client: {error}"),
                 }
             })?;
-        client_config.transport_config(quic_transport_config()?);
+        client_config.transport_config(quic_transport_config(self.tuning)?);
         let socket =
             UdpSocket::bind(self.bind_addr).map_err(|error| TransportError::ConnectionFailed {
                 connection_id: None,
@@ -622,6 +672,7 @@ fn new_runtime() -> Result<Arc<tokio::runtime::Runtime>, TransportError> {
 
 fn server_config_from_identity(
     identity: &QuicServerIdentity,
+    tuning: QuicTransportTuning,
 ) -> Result<ServerConfig, TransportError> {
     let cert_der = CertificateDer::from(identity.certificate_der.clone());
     let private_key = PrivatePkcs8KeyDer::from(identity.private_key_der.clone());
@@ -631,19 +682,21 @@ fn server_config_from_identity(
                 reason: format!("failed to configure QUIC server certificate: {error}"),
             }
         })?;
-    config.transport_config(quic_transport_config()?);
+    config.transport_config(quic_transport_config(tuning)?);
     Ok(config)
 }
 
-fn quic_transport_config() -> Result<Arc<TransportConfig>, TransportError> {
+fn quic_transport_config(
+    tuning: QuicTransportTuning,
+) -> Result<Arc<TransportConfig>, TransportError> {
     let mut config = TransportConfig::default();
     config
-        .max_idle_timeout(Some(MAX_IDLE_TIMEOUT.try_into().map_err(|error| {
-            TransportError::Protocol {
+        .max_idle_timeout(Some(tuning.max_idle_timeout.try_into().map_err(
+            |error| TransportError::Protocol {
                 reason: format!("invalid QUIC idle timeout: {error}"),
-            }
-        })?))
-        .keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
+            },
+        )?))
+        .keep_alive_interval(tuning.keep_alive_interval);
 
     Ok(Arc::new(config))
 }

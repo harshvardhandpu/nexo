@@ -12,6 +12,7 @@ pub use discovery::{
 };
 pub use quic::{
     QuicConnection, QuicListener, QuicServerIdentity, QuicStream, QuicTransportProvider,
+    QuicTransportTuning,
 };
 
 pub trait TransportProvider {

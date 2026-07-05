@@ -4,8 +4,8 @@ use common::{
     TransportEvent,
 };
 use networking::{
-    QuicConnection, QuicListener, QuicTransportProvider, TransportConnection, TransportListener,
-    TransportProvider, TransportStream,
+    QuicConnection, QuicListener, QuicTransportProvider, QuicTransportTuning, TransportConnection,
+    TransportListener, TransportProvider, TransportStream,
 };
 use std::time::Duration;
 
@@ -259,12 +259,18 @@ fn transport_events_do_not_accumulate_without_draining() {
 }
 
 #[test]
+#[ignore = "slow (35s): validates the real production tuning against Quinn's 30s default idle timeout; run with `--ignored`"]
 fn quic_transport_keeps_connection_alive_across_long_application_idle_gap() {
     // Regression for large transfers: after the last chunk, the receiver may
     // spend more than Quinn's default 30 second idle timeout verifying a large
     // destination file before sending the final verification frame. The QUIC
     // transport must keep the connection alive during that application-level
     // quiet period so the next length-prefixed frame can still be exchanged.
+    //
+    // This exercises the *real* production tuning end to end, so it must idle
+    // past the 30s default. The deterministic, sub-second version of this proof
+    // (with a negative control) is
+    // `quic_connection_survives_idle_gap_only_with_keep_alive`.
     let (mut sender_connection, mut receiver_connection) = connected_pair();
     let mut sender_stream = sender_connection.open_stream().expect("sender stream");
     let mut receiver_stream = receiver_connection
@@ -296,8 +302,106 @@ fn quic_transport_keeps_connection_alive_across_long_application_idle_gap() {
     );
 }
 
+#[test]
+fn quic_connection_survives_idle_gap_only_with_keep_alive() {
+    // Deterministic, sub-second proof of the large-transfer failure and its fix.
+    //
+    // Both peers use a short idle timeout and idle (no packets in either
+    // direction) for longer than it — the small-scale analog of the receiver's
+    // multi-minute whole-file verification during which neither side transmits.
+    //
+    // Negative control: with keep-alive DISABLED (Quinn's own default), the
+    // connection is torn down and the next frame fails with exactly the observed
+    // symptom, "connection lost".
+    //
+    // Fix: with keep-alive ENABLED and comfortably below the idle timeout, the
+    // driver PINGs across the gap on the runtime worker threads and the frame is
+    // exchanged normally.
+    let idle_timeout = Duration::from_millis(600);
+    let idle_gap = Duration::from_millis(1_800);
+
+    // --- Negative control: no keep-alive -> connection is lost across the gap.
+    let without_keep_alive = QuicTransportTuning {
+        keep_alive_interval: None,
+        max_idle_timeout: idle_timeout,
+    };
+    let (mut sender_connection, mut receiver_connection) = tuned_connected_pair(without_keep_alive);
+    let mut sender_stream = sender_connection.open_stream().expect("sender stream");
+    let mut receiver_stream = receiver_connection
+        .accept_stream()
+        .expect("receiver stream");
+    sender_stream
+        .send_message(chunk_envelope(1))
+        .expect("send before idle gap");
+    receiver_stream
+        .receive_message()
+        .expect("receive before idle gap");
+
+    std::thread::sleep(idle_gap);
+
+    let error = sender_stream
+        .send_message(chunk_envelope(2))
+        .expect_err("connection must be lost after idling past the timeout without keep-alive");
+    assert!(
+        error.to_string().contains("connection lost"),
+        "expected an idle-timeout 'connection lost', got: {error}"
+    );
+
+    // --- Fix: keep-alive keeps the same-length gap alive.
+    let with_keep_alive = QuicTransportTuning {
+        keep_alive_interval: Some(Duration::from_millis(120)),
+        max_idle_timeout: idle_timeout,
+    };
+    let (mut sender_connection, mut receiver_connection) = tuned_connected_pair(with_keep_alive);
+    let mut sender_stream = sender_connection.open_stream().expect("sender stream");
+    let mut receiver_stream = receiver_connection
+        .accept_stream()
+        .expect("receiver stream");
+    sender_stream
+        .send_message(chunk_envelope(1))
+        .expect("send before idle gap");
+    receiver_stream
+        .receive_message()
+        .expect("receive before idle gap");
+
+    std::thread::sleep(idle_gap);
+
+    let after_gap = accepted_envelope();
+    receiver_stream
+        .send_message(after_gap.clone())
+        .expect("keep-alive must hold the connection open across the idle gap");
+    assert_eq!(
+        sender_stream
+            .receive_message()
+            .expect("receive after idle gap"),
+        after_gap
+    );
+}
+
 fn connected_pair() -> (QuicConnection, QuicConnection) {
     let (mut sender, mut listener) = quic_pair();
+    let sender_thread = std::thread::spawn(move || sender.connect(&peer_b(), session_id()));
+    let receiver_connection = listener.accept().expect("receiver connection");
+    let sender_connection = sender_thread
+        .join()
+        .expect("sender thread")
+        .expect("sender connection");
+
+    (sender_connection, receiver_connection)
+}
+
+fn tuned_connected_pair(tuning: QuicTransportTuning) -> (QuicConnection, QuicConnection) {
+    let mut receiver = QuicTransportProvider::localhost(peer_b()).expect("receiver QUIC provider");
+    receiver.set_transport_tuning(tuning);
+    let mut listener = receiver.listen().expect("receiver QUIC listener");
+    let mut sender = QuicTransportProvider::localhost(peer_a()).expect("sender QUIC provider");
+    sender.set_transport_tuning(tuning);
+    sender.register_peer(
+        peer_b(),
+        listener.local_addr(),
+        listener.certificate_der().to_vec(),
+    );
+
     let sender_thread = std::thread::spawn(move || sender.connect(&peer_b(), session_id()));
     let receiver_connection = listener.accept().expect("receiver connection");
     let sender_connection = sender_thread
