@@ -9,6 +9,7 @@ pub mod discovery;
 pub mod quic;
 pub use discovery::{
     DiscoveryEvent, LocalDiscoveryProvider, PeerAdvertisement, PeerDiscovery, PeerInfo,
+    ServiceAdvertisement,
 };
 pub use quic::{
     QuicConnection, QuicListener, QuicServerIdentity, QuicStream, QuicTransportProvider,

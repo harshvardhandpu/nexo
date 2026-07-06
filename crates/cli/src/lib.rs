@@ -12,8 +12,8 @@ use engine::pipeline::{
 };
 use networking::{
     LocalDiscoveryProvider, PeerAdvertisement, PeerDiscovery, PeerInfo, QuicServerIdentity,
-    QuicTransportProvider, TransportConnection, TransportListener, TransportProvider,
-    TransportStream,
+    QuicTransportProvider, ServiceAdvertisement, TransportConnection, TransportListener,
+    TransportProvider, TransportStream,
 };
 use rand_core::{OsRng, RngCore};
 use std::collections::HashSet;
@@ -238,7 +238,14 @@ fn write_discovered_peers<W: Write>(peers: &[DiscoveredPeer], output: &mut W) ->
         writeln!(output, "(none)")?;
     } else {
         for peer in peers {
-            writeln!(output, "* {}", peer.display_name)?;
+            match peer.addresses.first() {
+                Some(address) => writeln!(
+                    output,
+                    "* {} — {}:{}",
+                    peer.display_name, address, peer.port
+                )?,
+                None => writeln!(output, "* {}", peer.display_name)?,
+            }
         }
     }
 
@@ -274,6 +281,15 @@ pub fn run_receive<W: Write>(config: &CliConfig, output: &mut W) -> CliResult<()
     };
     save_receiver_advert(config, &advert)?;
     writeln!(output, "receiving on {}", advert.address)?;
+
+    // Publish this receiver on the shared mDNS discovery layer so that
+    // `discover` (CLI or desktop) actually finds it. Without this the receiver
+    // was only written to the local `receiver.peer` file, which the UI reads for
+    // its "Advertised" state but discovery never consults -- two different
+    // sources of truth. Held for the whole receive session; unregisters on drop.
+    // Best-effort: a machine without usable multicast can still receive via
+    // `--host`, so a discovery failure must not abort the transfer.
+    let _discovery = advertise_receiver(config, &advert, output);
 
     let mut connection = listener.accept()?;
     let mut stream = connection.accept_stream()?;
@@ -678,6 +694,60 @@ fn local_display_name(peer_id: &PeerId) -> CliResult<String> {
     }
 
     Ok(hostname.chars().take(200).collect())
+}
+
+/// Discovery identity a receiver advertises itself under.
+///
+/// Derived from (but distinct from) this device's discovery peer id so that a
+/// `discover` running on the *same* device does not filter the receiver out as
+/// "self" (the discover self-advert uses the plain device id) and the mDNS
+/// service instance name never collides with that self-advert — while staying
+/// unique per device for multi-machine discovery.
+fn receiver_discovery_peer_id(device_peer_id: &PeerId) -> PeerId {
+    PeerId(format!("{}-recv", device_peer_id.0))
+}
+
+/// Best-effort registration of this receiver on the local mDNS discovery layer.
+///
+/// Returns the live advertisement handle (kept for the receive session) or
+/// `None` if discovery is unavailable — receiving must still work via `--host`,
+/// so a failure here only warns.
+fn advertise_receiver<W: Write>(
+    config: &CliConfig,
+    advert: &ReceiverAdvert,
+    output: &mut W,
+) -> Option<ServiceAdvertisement> {
+    // A loopback-only endpoint is unreachable from any other machine, so there
+    // is nothing to gain from announcing it on the LAN discovery layer. Skipping
+    // it also keeps loopback integration tests free of mDNS daemons.
+    if advert.address.ip().is_loopback() {
+        return None;
+    }
+
+    let peer_id = match load_or_create_peer_id(config) {
+        Ok(peer_id) => peer_id,
+        Err(error) => {
+            let _ = writeln!(output, "warning: skipping network advertisement: {error}");
+            return None;
+        }
+    };
+    let display_name = local_display_name(&peer_id).unwrap_or_else(|_| "Nexo".to_owned());
+    let advertisement = PeerAdvertisement::new(
+        receiver_discovery_peer_id(&peer_id),
+        display_name,
+        advert.address.port(),
+    );
+
+    match ServiceAdvertisement::register(advertisement) {
+        Ok(handle) => Some(handle),
+        Err(error) => {
+            let _ = writeln!(
+                output,
+                "warning: receiver is not discoverable on this network: {error}"
+            );
+            None
+        }
+    }
 }
 
 fn load_receive_checkpoint(
@@ -1314,7 +1384,22 @@ mod tests {
 
         let output = String::from_utf8(output).expect("discover output");
         assert!(output.contains("Found peers:\n"));
-        assert!(output.contains("* Harsh-Laptop\n"));
+        // Endpoint is shown so it can be pasted into `send --host`.
+        assert!(output.contains("* Harsh-Laptop — 127.0.0.1:43001\n"));
+    }
+
+    #[test]
+    fn receiver_discovery_peer_id_is_device_unique_and_distinct_from_device() {
+        let device = PeerId("peer-0123456789abcdef0123456789abcdef".to_owned());
+        let receiver = receiver_discovery_peer_id(&device);
+
+        // Distinct from the device id (so same-host discover does not self-filter
+        // it) but derived from it (so it stays unique across machines).
+        assert_ne!(receiver, device);
+        assert_eq!(receiver.0, format!("{}-recv", device.0));
+
+        let other = PeerId("peer-ffffffffffffffffffffffffffffffff".to_owned());
+        assert_ne!(receiver_discovery_peer_id(&other), receiver);
     }
 
     #[test]

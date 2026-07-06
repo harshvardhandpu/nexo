@@ -201,24 +201,7 @@ impl LocalDiscoveryProvider {
 
         let daemon = ServiceDaemon::new().map_err(discovery_error)?;
         let events = daemon.browse(NEXO_SERVICE_TYPE).map_err(discovery_error)?;
-        let properties = HashMap::from([
-            (PEER_ID_PROPERTY.to_owned(), advertisement.peer_id.0.clone()),
-            (
-                DISPLAY_NAME_PROPERTY.to_owned(),
-                advertisement.display_name.clone(),
-            ),
-            (VERSION_PROPERTY.to_owned(), DISCOVERY_VERSION.to_owned()),
-        ]);
-        let service = ServiceInfo::new(
-            NEXO_SERVICE_TYPE,
-            &advertisement.peer_id.0,
-            &service_hostname(&advertisement.peer_id),
-            "",
-            advertisement.port,
-            properties,
-        )
-        .map_err(discovery_error)?
-        .enable_addr_auto();
+        let service = build_service_info(&advertisement)?;
         let service_fullname = service.get_fullname().to_owned();
         daemon.register(service).map_err(discovery_error)?;
 
@@ -318,6 +301,90 @@ impl Drop for LocalDiscoveryProvider {
     fn drop(&mut self) {
         let _ = self.stop(false);
     }
+}
+
+/// An advertise-only presence on the local network.
+///
+/// Registers this peer as a discoverable `_nexo._udp` service and unregisters it
+/// on drop. Unlike [`LocalDiscoveryProvider`] it does **not** browse, so a
+/// long-lived process (such as a receiver waiting for a transfer) can stay
+/// discoverable without accumulating inbound discovery events. This is the
+/// missing piece that lets a receiver appear in another peer's `discover`.
+pub struct ServiceAdvertisement {
+    daemon: ServiceDaemon,
+    service_fullname: String,
+    stopped: bool,
+}
+
+impl ServiceAdvertisement {
+    /// Publishes `advertisement` on the local network until dropped.
+    pub fn register(advertisement: PeerAdvertisement) -> Result<Self> {
+        validate_advertisement(&advertisement)?;
+        let daemon = ServiceDaemon::new().map_err(discovery_error)?;
+        let service = build_service_info(&advertisement)?;
+        let service_fullname = service.get_fullname().to_owned();
+        daemon.register(service).map_err(discovery_error)?;
+
+        Ok(Self {
+            daemon,
+            service_fullname,
+            stopped: false,
+        })
+    }
+
+    pub fn service_fullname(&self) -> &str {
+        &self.service_fullname
+    }
+
+    pub fn shutdown(&mut self) -> Result<()> {
+        self.stop(true)
+    }
+
+    fn stop(&mut self, wait_for_goodbye: bool) -> Result<()> {
+        if self.stopped {
+            return Ok(());
+        }
+
+        let unregister = self
+            .daemon
+            .unregister(&self.service_fullname)
+            .map_err(discovery_error)?;
+        if wait_for_goodbye {
+            let _ = unregister.recv_timeout(Duration::from_millis(500));
+        }
+        self.daemon.shutdown().map_err(discovery_error)?;
+        self.stopped = true;
+        Ok(())
+    }
+}
+
+impl Drop for ServiceAdvertisement {
+    fn drop(&mut self) {
+        let _ = self.stop(false);
+    }
+}
+
+fn build_service_info(advertisement: &PeerAdvertisement) -> Result<ServiceInfo> {
+    let properties = HashMap::from([
+        (PEER_ID_PROPERTY.to_owned(), advertisement.peer_id.0.clone()),
+        (
+            DISPLAY_NAME_PROPERTY.to_owned(),
+            advertisement.display_name.clone(),
+        ),
+        (VERSION_PROPERTY.to_owned(), DISCOVERY_VERSION.to_owned()),
+    ]);
+    let service = ServiceInfo::new(
+        NEXO_SERVICE_TYPE,
+        &advertisement.peer_id.0,
+        &service_hostname(&advertisement.peer_id),
+        "",
+        advertisement.port,
+        properties,
+    )
+    .map_err(discovery_error)?
+    .enable_addr_auto();
+
+    Ok(service)
 }
 
 fn validate_advertisement(advertisement: &PeerAdvertisement) -> Result<()> {
