@@ -29,9 +29,15 @@
     "active": true,
     "targets": ["appimage", "deb"],
     "category": "Utility",
-    "shortDescription": "Encrypted, resumable QUIC file transfer",
-    "longDescription": "Nexo moves large files over encrypted QUIC with chunk-level integrity and crash-safe resume, wrapped in a modern animated desktop interface.",
-    "icon": ["icons/icon.png"],
+    "shortDescription": "Encrypted, resumable peer-to-peer file transfer",
+    "longDescription": "Nexo moves large files directly between devices over encrypted QUIC with chunk-level integrity and crash-safe resume — no cloud, no accounts. A premium, animated desktop experience similar to AirDrop and LocalSend.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png",
+      "icons/icon.ico"
+    ],
     "linux": {
       "deb": {
         "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0"]

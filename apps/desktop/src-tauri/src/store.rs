@@ -20,6 +20,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const TRUSTED_FILE: &str = "trusted-devices.json";
 const HISTORY_FILE: &str = "transfer-history.json";
 const SETTINGS_FILE: &str = "background-settings.json";
+const ONBOARDING_FILE: &str = "onboarding.json";
+const PREFERENCES_FILE: &str = "preferences.json";
 const HISTORY_CAP: usize = 500;
 
 /// Seconds since the Unix epoch (0 if the clock is before the epoch).
@@ -47,6 +49,41 @@ impl Default for BackgroundSettings {
         Self {
             background_receiving: true,
             start_on_login: false,
+        }
+    }
+}
+
+/// Onboarding completion state (Feature 3). Once `completed` is true the
+/// welcome flow is never shown again.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OnboardingState {
+    pub completed: bool,
+    pub completed_at: u64,
+}
+
+/// User-facing application preferences surfaced in the polished Settings screen
+/// (Feature 4). All are product-level metadata; none alter the transfer engine.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AppPreferences {
+    pub device_name: String,
+    pub theme: String,
+    pub download_dir: String,
+    pub auto_accept_trusted: bool,
+    pub notifications_enabled: bool,
+    pub discoverable: bool,
+}
+
+impl Default for AppPreferences {
+    fn default() -> Self {
+        Self {
+            device_name: String::new(),
+            theme: "midnight".to_owned(),
+            download_dir: String::new(),
+            auto_accept_trusted: false,
+            notifications_enabled: true,
+            discoverable: true,
         }
     }
 }
@@ -245,6 +282,43 @@ impl AppStore {
         let _lock = self.guard.lock();
         write_json(&self.state_dir, &self.settings_path(), &settings);
     }
+
+    // ---- Onboarding -------------------------------------------------------
+
+    fn onboarding_path(&self) -> PathBuf {
+        self.state_dir.join(ONBOARDING_FILE)
+    }
+
+    pub fn onboarding(&self) -> OnboardingState {
+        let _lock = self.guard.lock();
+        read_json::<OnboardingState>(&self.onboarding_path())
+    }
+
+    pub fn complete_onboarding(&self) -> OnboardingState {
+        let state = OnboardingState {
+            completed: true,
+            completed_at: unix_now(),
+        };
+        let _lock = self.guard.lock();
+        write_json(&self.state_dir, &self.onboarding_path(), &state);
+        state
+    }
+
+    // ---- Preferences ------------------------------------------------------
+
+    fn preferences_path(&self) -> PathBuf {
+        self.state_dir.join(PREFERENCES_FILE)
+    }
+
+    pub fn preferences(&self) -> AppPreferences {
+        let _lock = self.guard.lock();
+        read_json_or(&self.preferences_path(), AppPreferences::default())
+    }
+
+    pub fn set_preferences(&self, preferences: AppPreferences) {
+        let _lock = self.guard.lock();
+        write_json(&self.state_dir, &self.preferences_path(), &preferences);
+    }
 }
 
 fn read_json_or<T: for<'de> Deserialize<'de>>(path: &Path, fallback: T) -> T {
@@ -395,5 +469,38 @@ mod tests {
         let loaded = store.background_settings();
         assert!(!loaded.background_receiving);
         assert!(loaded.start_on_login);
+    }
+
+    #[test]
+    fn onboarding_starts_incomplete_and_persists_completion() {
+        let store = temp_store("onboarding");
+        assert!(!store.onboarding().completed);
+
+        let done = store.complete_onboarding();
+        assert!(done.completed);
+        assert!(done.completed_at > 0);
+        // Persisted: a fresh store over the same dir stays completed.
+        assert!(store.onboarding().completed);
+    }
+
+    #[test]
+    fn preferences_default_and_roundtrip() {
+        let store = temp_store("prefs");
+        let defaults = store.preferences();
+        assert_eq!(defaults.theme, "midnight");
+        assert!(defaults.discoverable);
+        assert!(defaults.notifications_enabled);
+        assert!(!defaults.auto_accept_trusted);
+
+        let mut prefs = defaults;
+        prefs.device_name = "Harsh Laptop".to_owned();
+        prefs.auto_accept_trusted = true;
+        prefs.discoverable = false;
+        store.set_preferences(prefs);
+
+        let loaded = store.preferences();
+        assert_eq!(loaded.device_name, "Harsh Laptop");
+        assert!(loaded.auto_accept_trusted);
+        assert!(!loaded.discoverable);
     }
 }

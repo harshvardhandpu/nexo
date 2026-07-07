@@ -1,3 +1,4 @@
+mod autostart;
 mod store;
 
 use cli::{
@@ -294,6 +295,13 @@ pub struct ReceiverStatusResponse {
     pub discoverable: bool,
     pub background_enabled: bool,
     pub endpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OnboardingResponse {
+    pub completed: bool,
+    pub completed_at: u64,
 }
 
 /// UI-facing view of a pending AirDrop transfer request (the modal payload).
@@ -1073,7 +1081,74 @@ fn set_background_settings(
     if background_receiving {
         let _ = spawn_receive_job(&app, &state);
     }
+    // Feature 5: actually register/unregister OS launch-on-login. Best-effort —
+    // a failure here (e.g. read-only profile) must not fail the settings save.
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = autostart::set_enabled(start_on_login, &exe);
+    }
     Ok(settings.into())
+}
+
+// ---- Feature 3: onboarding ------------------------------------------------
+
+#[tauri::command]
+fn get_onboarding(state: State<'_, DesktopAppState>) -> OnboardingResponse {
+    let onboarding = state.store.onboarding();
+    OnboardingResponse {
+        completed: onboarding.completed,
+        completed_at: onboarding.completed_at,
+    }
+}
+
+/// Persists device/discoverable/background choices from onboarding and marks it
+/// complete so it never shows again.
+#[tauri::command]
+fn complete_onboarding(
+    device_name: String,
+    discoverable: bool,
+    background_receiving: bool,
+    start_on_login: bool,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopAppState>,
+) -> DesktopResult<OnboardingResponse> {
+    let mut prefs = state.store.preferences();
+    prefs.device_name = device_name.trim().to_owned();
+    prefs.discoverable = discoverable;
+    state.store.set_preferences(prefs);
+
+    let settings = store::BackgroundSettings {
+        background_receiving,
+        start_on_login,
+    };
+    state.store.set_background_settings(settings);
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = autostart::set_enabled(start_on_login, &exe);
+    }
+    if background_receiving {
+        let _ = spawn_receive_job(&app, &state);
+    }
+
+    let done = state.store.complete_onboarding();
+    Ok(OnboardingResponse {
+        completed: done.completed,
+        completed_at: done.completed_at,
+    })
+}
+
+// ---- Feature 4: application preferences -----------------------------------
+
+#[tauri::command]
+fn get_preferences(state: State<'_, DesktopAppState>) -> store::AppPreferences {
+    state.store.preferences()
+}
+
+#[tauri::command]
+fn set_preferences(
+    preferences: store::AppPreferences,
+    state: State<'_, DesktopAppState>,
+) -> DesktopResult<store::AppPreferences> {
+    state.store.set_preferences(preferences.clone());
+    Ok(preferences)
 }
 
 /// Receiver status for the Dashboard (Feature 5): whether a receive session is
@@ -1226,6 +1301,14 @@ pub fn run() {
                 let _ = spawn_receive_job(&handle, &state);
             }
 
+            // Feature 5: when launched by autostart with `--hidden`, start
+            // minimized to the tray instead of popping the window.
+            if std::env::args().any(|arg| arg == "--hidden")
+                && let Some(window) = app.get_webview_window("main")
+            {
+                let _ = window.hide();
+            }
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -1253,6 +1336,10 @@ pub fn run() {
             get_receiver_status,
             get_background_settings,
             set_background_settings,
+            get_onboarding,
+            complete_onboarding,
+            get_preferences,
+            set_preferences,
             discover_known_peers,
             start_receive,
             create_transfer_request,

@@ -8,6 +8,8 @@ import { IncomingTransferDialog } from "./components/IncomingTransferDialog";
 import { Banner, StatusPill } from "./components/ui";
 import { useDesktopData } from "./lib/useDesktopData";
 import { notifyIncoming } from "./lib/notify";
+import { getOnboarding } from "./api/desktop";
+import { Onboarding } from "./screens/Onboarding";
 import {
   INCOMING_TRANSFER_EVENT,
   TRANSFER_REQUEST_EVENT,
@@ -30,12 +32,20 @@ import { SettingsScreen } from "./screens/SettingsScreen";
 export default function App() {
   const [screen, setScreen] = useState<Screen>("dashboard");
   const data = useDesktopData();
+  const [onboardingDone, setOnboardingDone] = useState<boolean | null>(null);
   const [pendingRequest, setPendingRequest] = useState<TransferRequest | null>(
     null,
   );
   const [confirmBusy, setConfirmBusy] = useState(false);
   const [incoming, setIncoming] = useState<IncomingTransfer | null>(null);
   const [incomingBusy, setIncomingBusy] = useState(false);
+
+  // Feature 3: decide whether to show the first-launch onboarding.
+  useEffect(() => {
+    getOnboarding()
+      .then((state) => setOnboardingDone(state.completed))
+      .catch(() => setOnboardingDone(true));
+  }, []);
 
   // AirDrop: the backend emits `transfer_request_created` for every send intent.
   // We show the mandatory confirmation modal; no transfer runs until approved.
@@ -146,6 +156,14 @@ export default function App() {
         return <Dashboard data={data} onNavigate={setScreen} />;
     }
   };
+
+  // Hold the UI until we know onboarding status; show the flow if incomplete.
+  if (onboardingDone === null) {
+    return <div className="app app--loading" />;
+  }
+  if (!onboardingDone) {
+    return <Onboarding onDone={() => setOnboardingDone(true)} />;
+  }
 
   return (
     <div className="app">

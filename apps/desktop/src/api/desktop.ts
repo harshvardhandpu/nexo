@@ -30,6 +30,46 @@ export function getReceiverStatus() {
   return invoke<ReceiverStatus>("get_receiver_status");
 }
 
+export type Onboarding = {
+  completed: boolean;
+  completedAt: number;
+};
+
+export type AppPreferences = {
+  deviceName: string;
+  theme: string;
+  downloadDir: string;
+  autoAcceptTrusted: boolean;
+  notificationsEnabled: boolean;
+  discoverable: boolean;
+};
+
+export function getOnboarding() {
+  return invoke<Onboarding>("get_onboarding");
+}
+
+export function completeOnboarding(
+  deviceName: string,
+  discoverable: boolean,
+  backgroundReceiving: boolean,
+  startOnLogin: boolean,
+) {
+  return invoke<Onboarding>("complete_onboarding", {
+    deviceName,
+    discoverable,
+    backgroundReceiving,
+    startOnLogin,
+  });
+}
+
+export function getPreferences() {
+  return invoke<AppPreferences>("get_preferences");
+}
+
+export function setPreferences(preferences: AppPreferences) {
+  return invoke<AppPreferences>("set_preferences", { preferences });
+}
+
 export type DesktopSettings = {
   stateDir: string;
   receiveDir: string;

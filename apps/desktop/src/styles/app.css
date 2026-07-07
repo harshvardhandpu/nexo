@@ -1012,3 +1012,90 @@
   font-size: 12.5px;
   color: var(--text-muted);
 }
+
+/* ===== Onboarding ========================================================= */
+.app--loading {
+  background: var(--bg-void);
+}
+.onboarding {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  z-index: 100;
+}
+.onboarding__card {
+  width: min(520px, 94vw);
+  padding: 30px 30px 26px;
+  text-align: center;
+  animation: page-enter var(--dur-slow) var(--ease) both;
+}
+.onboarding__dots {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  margin-bottom: 22px;
+}
+.onboarding__dot {
+  width: 24px;
+  height: 5px;
+  border-radius: var(--radius-pill);
+  background: var(--glass-border);
+  transition: background var(--dur) var(--ease);
+}
+.onboarding__dot.is-active {
+  background: var(--accent-grad);
+}
+.onboarding__dot.is-done {
+  background: var(--cyan-soft);
+}
+.onboarding__body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  animation: rise var(--dur) var(--ease) both;
+}
+.onboarding__viz {
+  width: 100%;
+  height: 130px;
+  margin-bottom: -6px;
+}
+.onboarding__glyph {
+  width: 60px;
+  height: 60px;
+  border-radius: 18px;
+  display: grid;
+  place-items: center;
+  color: var(--cyan);
+  background: var(--accent-grad-soft);
+  border: 1px solid var(--glass-border-strong);
+  animation: node-pulse 3.5s var(--ease-in-out) infinite;
+}
+.onboarding__glyph--ok {
+  color: var(--success);
+  background: rgba(52, 211, 153, 0.12);
+  border-color: rgba(52, 211, 153, 0.4);
+  animation:
+    node-pulse 3.5s var(--ease-in-out) infinite,
+    glow-burst 1.1s var(--ease) both;
+}
+.onboarding__title {
+  font-size: 25px;
+}
+.onboarding__lead {
+  color: var(--text-muted);
+  font-size: 14.5px;
+  line-height: 1.6;
+  max-width: 42ch;
+  margin: 0 0 6px;
+}
+.onboarding__toggles {
+  width: 100%;
+  text-align: left;
+  padding: 4px 14px;
+  border-radius: var(--radius);
+  background: rgba(4, 6, 14, 0.5);
+  border: 1px solid var(--glass-border);
+}
