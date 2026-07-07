@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { AlertTriangle, Wifi, WifiOff } from "lucide-react";
 import { Sidebar } from "./components/Sidebar";
@@ -7,8 +7,9 @@ import { ConfirmDialog } from "./components/ConfirmDialog";
 import { IncomingTransferDialog } from "./components/IncomingTransferDialog";
 import { Banner, StatusPill } from "./components/ui";
 import { useDesktopData } from "./lib/useDesktopData";
-import { notifyIncoming } from "./lib/notify";
-import { getOnboarding } from "./api/desktop";
+import { notifyCompleted, notifyFailed, notifyIncoming } from "./lib/notify";
+import { latestProgress } from "./lib/progress";
+import { getOnboarding, getPreferences } from "./api/desktop";
 import { Onboarding } from "./screens/Onboarding";
 import {
   INCOMING_TRANSFER_EVENT,
@@ -39,6 +40,8 @@ export default function App() {
   const [confirmBusy, setConfirmBusy] = useState(false);
   const [incoming, setIncoming] = useState<IncomingTransfer | null>(null);
   const [incomingBusy, setIncomingBusy] = useState(false);
+  const notificationsEnabled = useRef(true);
+  const seenTerminalJobs = useRef<Set<number>>(new Set());
 
   // Feature 3: decide whether to show the first-launch onboarding.
   useEffect(() => {
@@ -46,6 +49,39 @@ export default function App() {
       .then((state) => setOnboardingDone(state.completed))
       .catch(() => setOnboardingDone(true));
   }, []);
+
+  // Track the notifications preference so notify* calls can honor it.
+  useEffect(() => {
+    const load = () =>
+      void getPreferences()
+        .then((prefs) => {
+          notificationsEnabled.current = prefs.notificationsEnabled;
+        })
+        .catch(() => {});
+    load();
+    const timer = window.setInterval(load, 5000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  // Task 4: fire completed/failed notifications as jobs reach a terminal state
+  // (only once each, and only surfaced by notify* when the window is hidden).
+  useEffect(() => {
+    for (const job of data.jobs) {
+      if (job.state === "running" || seenTerminalJobs.current.has(job.jobId)) {
+        continue;
+      }
+      seenTerminalJobs.current.add(job.jobId);
+      const hasProgress = Boolean(latestProgress(job.output));
+      const name =
+        data.status?.latest?.fileName ??
+        (job.kind === "receive" ? "Incoming file" : "Transfer");
+      if (job.state === "completed" && hasProgress) {
+        void notifyCompleted(name, notificationsEnabled.current);
+      } else if (job.state === "failed") {
+        void notifyFailed(name, notificationsEnabled.current);
+      }
+    }
+  }, [data.jobs, data.status]);
 
   // AirDrop: the backend emits `transfer_request_created` for every send intent.
   // We show the mandatory confirmation modal; no transfer runs until approved.
@@ -66,7 +102,7 @@ export default function App() {
       INCOMING_TRANSFER_EVENT,
       (event) => {
         setIncoming(event.payload);
-        void notifyIncoming(event.payload);
+        void notifyIncoming(event.payload, notificationsEnabled.current);
       },
     );
     return () => {

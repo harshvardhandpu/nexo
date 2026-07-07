@@ -384,7 +384,37 @@ fn confirm_incoming_on_terminal(request: &IncomingTransferRequest) -> bool {
 /// returns `true`. On rejection it sends the protocol's existing
 /// `TransferResponse::Rejected` and closes cleanly — crucially *before* any
 /// output file is created, so a rejected transfer leaves nothing on disk.
+/// Options that tune a gated receive session without touching the transfer
+/// engine. All fields are orchestration-level policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiveOptions {
+    /// Advertise the receiver over mDNS. When false the receiver still runs and
+    /// accepts direct connections by address — only discovery is suppressed.
+    pub discoverable: bool,
+}
+
+impl Default for ReceiveOptions {
+    fn default() -> Self {
+        Self { discoverable: true }
+    }
+}
+
 pub fn run_receive_gated<W, F>(config: &CliConfig, output: &mut W, approve: F) -> CliResult<()>
+where
+    W: Write,
+    F: FnOnce(&IncomingTransferRequest) -> bool,
+{
+    run_receive_gated_with(config, output, ReceiveOptions::default(), approve)
+}
+
+/// Consent-gated receive with explicit [`ReceiveOptions`]. See
+/// [`run_receive_gated`] for the approval semantics.
+pub fn run_receive_gated_with<W, F>(
+    config: &CliConfig,
+    output: &mut W,
+    options: ReceiveOptions,
+    approve: F,
+) -> CliResult<()>
 where
     W: Write,
     F: FnOnce(&IncomingTransferRequest) -> bool,
@@ -415,7 +445,15 @@ where
     // sources of truth. Held for the whole receive session; unregisters on drop.
     // Best-effort: a machine without usable multicast can still receive via
     // `--host`, so a discovery failure must not abort the transfer.
-    let _discovery = advertise_receiver(config, &advert, output);
+    //
+    // When `discoverable` is off the receiver still runs and accepts direct
+    // connections by address; only the mDNS advertisement is suppressed.
+    let _discovery = if options.discoverable {
+        advertise_receiver(config, &advert, output)
+    } else {
+        writeln!(output, "discovery disabled: not advertising over mDNS")?;
+        None
+    };
 
     let mut connection = listener.accept()?;
     let mut stream = connection.accept_stream()?;
@@ -1931,6 +1969,66 @@ mod tests {
         assert!(accepted.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(
             fs::read(receive_dir.join("ok.txt")).expect("received"),
+            contents
+        );
+    }
+
+    #[test]
+    fn non_discoverable_receiver_skips_mdns_but_still_receives_by_address() {
+        // Task 3: discoverable=false must suppress the mDNS advertisement while
+        // the receiver still accepts a direct connection by address.
+        let workspace = TempWorkspace::new("quic-cli-nodisc");
+        let source = workspace.path("direct.txt");
+        let receive_dir = workspace.path("received");
+        let state_dir = workspace.path("state");
+        let contents = b"nexo direct connect without discovery";
+        fs::create_dir_all(&receive_dir).expect("receive dir");
+        fs::write(&source, contents).expect("source");
+        let config = CliConfig {
+            state_dir,
+            receive_dir: receive_dir.clone(),
+            chunk_size: 8,
+        };
+        let receive_config = config.clone();
+
+        let receiver = thread::spawn(move || {
+            let mut output = Vec::new();
+            run_receive_gated_with(
+                &receive_config,
+                &mut output,
+                ReceiveOptions {
+                    discoverable: false,
+                },
+                |_request| true,
+            )?;
+            String::from_utf8(output).map_err(|error| {
+                Box::new(IoError::new(ErrorKind::InvalidData, error))
+                    as Box<dyn Error + Send + Sync>
+            })
+        });
+        wait_for_receiver_advert(&config);
+        let advert = load_receiver_advert(&config).expect("receiver advert");
+        let mut send_output = Vec::new();
+
+        run_send_gated(
+            &source,
+            Some(advert.address),
+            true,
+            &config,
+            &mut send_output,
+        )
+        .expect("direct send to non-discoverable receiver");
+        let receive_output = receiver
+            .join()
+            .expect("receiver thread")
+            .expect("receive completes");
+
+        assert!(
+            receive_output.contains("discovery disabled"),
+            "must announce discovery is off: {receive_output}"
+        );
+        assert_eq!(
+            fs::read(receive_dir.join("direct.txt")).expect("received"),
             contents
         );
     }

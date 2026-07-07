@@ -21,6 +21,7 @@ import {
   setPreferences,
 } from "../api/desktop";
 import { GlassPanel, PanelHead, Toggle } from "../components/ui";
+import { DiagnosticsPanel } from "../components/DiagnosticsPanel";
 import { formatBytes } from "../utils";
 
 function Row({ k, v }: { k: string; v: string }) {
@@ -205,6 +206,8 @@ export function SettingsScreen({ data }: { data: DesktopData }) {
           </div>
         </GlassPanel>
       </div>
+
+      <DiagnosticsPanel />
 
       <GlassPanel>
         <PanelHead icon={Cpu} title="About Nexo" />

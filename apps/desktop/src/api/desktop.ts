@@ -70,6 +70,29 @@ export function setPreferences(preferences: AppPreferences) {
   return invoke<AppPreferences>("set_preferences", { preferences });
 }
 
+/** Emitted when a trusted-device transfer is auto-accepted without a prompt. */
+export const INCOMING_AUTO_ACCEPTED_EVENT = "incoming_transfer_auto_accepted";
+
+export type Diagnostics = {
+  deviceId: string;
+  certificateFingerprint: string;
+  mdnsDiscoverable: boolean;
+  receiverRunning: boolean;
+  endpoint: string | null;
+  stateDir: string;
+  downloadDir: string;
+  lastTransfer: string | null;
+  totalTransfers: number;
+  completedTransfers: number;
+  failedTransfers: number;
+  bytesSent: number;
+  bytesReceived: number;
+};
+
+export function getDiagnostics() {
+  return invoke<Diagnostics>("get_diagnostics");
+}
+
 export type DesktopSettings = {
   stateDir: string;
   receiveDir: string;

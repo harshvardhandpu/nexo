@@ -2,9 +2,9 @@ mod autostart;
 mod store;
 
 use cli::{
-    CliConfig, CliStatePaths, DiscoveredPeer, IncomingTransferRequest, ReceiverEndpoint,
-    TransferStatusSnapshot, build_transfer_request, discover_peers, receiver_endpoint,
-    run_receive_gated, run_send, transfer_status_snapshot,
+    CliConfig, CliStatePaths, DiscoveredPeer, IncomingTransferRequest, ReceiveOptions,
+    ReceiverEndpoint, TransferStatusSnapshot, build_transfer_request, discover_peers,
+    receiver_endpoint, run_receive_gated_with, run_send, transfer_status_snapshot,
 };
 use engine::chunker::default_chunk_size;
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,9 @@ type DesktopResult<T> = Result<T, String>;
 const TRANSFER_REQUEST_EVENT: &str = "transfer_request_created";
 /// Event name emitted when an incoming transfer needs the receiver's approval.
 const INCOMING_TRANSFER_EVENT: &str = "incoming_transfer_request";
+/// Event emitted when a trusted-device transfer was auto-accepted (no prompt),
+/// so the UI can surface a passive notification instead of a dialog.
+const INCOMING_AUTO_ACCEPTED_EVENT: &str = "incoming_transfer_auto_accepted";
 
 #[derive(Debug)]
 pub struct DesktopAppState {
@@ -302,6 +305,24 @@ pub struct ReceiverStatusResponse {
 pub struct OnboardingResponse {
     pub completed: bool,
     pub completed_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsResponse {
+    pub device_id: String,
+    pub certificate_fingerprint: String,
+    pub mdns_discoverable: bool,
+    pub receiver_running: bool,
+    pub endpoint: Option<String>,
+    pub state_dir: String,
+    pub download_dir: String,
+    pub last_transfer: Option<String>,
+    pub total_transfers: u64,
+    pub completed_transfers: u64,
+    pub failed_transfers: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
 }
 
 /// UI-facing view of a pending AirDrop transfer request (the modal payload).
@@ -595,7 +616,25 @@ fn spawn_receive_job(app: &tauri::AppHandle, state: &DesktopAppState) -> Desktop
         return Ok(*existing);
     }
 
-    let config = state.config();
+    let prefs = state.store.preferences();
+    // Task 2: receive into the user's chosen download folder when set and usable;
+    // otherwise fall back to the default receive_dir. Storage/state paths are
+    // untouched — only where completed files land changes.
+    let base_config = state.config();
+    let config = CliConfig {
+        receive_dir: resolve_download_dir(&prefs.download_dir, &base_config.receive_dir),
+        ..base_config
+    };
+    // Task 3: only advertise over mDNS when the user is discoverable. The
+    // receiver still accepts direct-by-address connections when off.
+    let options = ReceiveOptions {
+        discoverable: prefs.discoverable,
+    };
+    // Task 1: auto-accept policy, evaluated per incoming request. Fail-safe: any
+    // uncertainty falls through to the manual dialog. Never bypasses the QUIC
+    // certificate handshake.
+    let auto_accept = should_auto_accept(&prefs, &state.store.trusted_devices());
+
     let job_id = state.next_job_id();
     insert_job(
         &state.jobs,
@@ -604,12 +643,20 @@ fn spawn_receive_job(app: &tauri::AppHandle, state: &DesktopAppState) -> Desktop
     )?;
 
     // Receiver-side approval gate. The approver runs on the receive thread when
-    // the sender's metadata arrives: it emits `incoming_transfer_request` and
-    // blocks until the UI answers via approve_/reject_incoming_request. The QUIC
-    // keep-alive holds the connection open while it waits. Never auto-accepts.
+    // the sender's metadata arrives. When auto-accept applies it approves
+    // without a prompt; otherwise it emits `incoming_transfer_request` and blocks
+    // until the UI answers. The QUIC keep-alive holds the connection open while
+    // it waits.
     let incoming = state.incoming.clone();
     let app = app.clone();
     let approver = move |request: &IncomingTransferRequest| -> bool {
+        if auto_accept {
+            let _ = app.emit(
+                INCOMING_AUTO_ACCEPTED_EVENT,
+                IncomingTransferResponse::from(request),
+            );
+            return true;
+        }
         let response = IncomingTransferResponse::from(request);
         let (decision_tx, decision_rx) = std::sync::mpsc::sync_channel::<bool>(1);
         {
@@ -645,10 +692,52 @@ fn spawn_receive_job(app: &tauri::AppHandle, state: &DesktopAppState) -> Desktop
             filename: "(incoming)".to_owned(),
             peer: "incoming".to_owned(),
         },
-        move |output| run_receive_gated(&config, output, approver),
+        move |output| run_receive_gated_with(&config, output, options, approver),
     );
 
     Ok(job_id)
+}
+
+/// Whether an incoming transfer should be auto-accepted without a prompt.
+///
+/// Fail-safe policy (Task 1): only when the user has explicitly enabled
+/// `auto_accept_trusted` AND this device already has at least one trusted peer
+/// on record. The QUIC certificate handshake still runs for every connection —
+/// this only decides whether to skip the *UI* approval prompt, never whether to
+/// trust the transport. With no trusted devices, or the setting off, every
+/// transfer shows the dialog.
+fn should_auto_accept(prefs: &store::AppPreferences, trusted: &[store::TrustedDevice]) -> bool {
+    prefs.auto_accept_trusted && !trusted.is_empty()
+}
+
+/// Resolves the receive directory: the user's `download_dir` when it is set and
+/// creatable/writable, otherwise the default. Never returns an unusable path.
+fn resolve_download_dir(download_dir: &str, fallback: &std::path::Path) -> PathBuf {
+    let trimmed = download_dir.trim();
+    if trimmed.is_empty() {
+        return fallback.to_path_buf();
+    }
+    let candidate = PathBuf::from(trimmed);
+    if std::fs::create_dir_all(&candidate).is_ok() && is_writable_dir(&candidate) {
+        candidate
+    } else {
+        fallback.to_path_buf()
+    }
+}
+
+/// True if `dir` is a directory we can create a file in.
+fn is_writable_dir(dir: &std::path::Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    let probe = dir.join(".nexo-write-probe");
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 #[tauri::command]
@@ -1177,6 +1266,74 @@ fn get_receiver_status(state: State<'_, DesktopAppState>) -> DesktopResult<Recei
     })
 }
 
+// ---- Task 5: diagnostics --------------------------------------------------
+
+/// Read-only diagnostics for a hidden Settings → Advanced page. All values come
+/// from existing state; nothing here alters the engine.
+#[tauri::command]
+fn get_diagnostics(state: State<'_, DesktopAppState>) -> DesktopResult<DiagnosticsResponse> {
+    let config = state.config();
+    let prefs = state.store.preferences();
+
+    let device_id = std::fs::read_to_string(config.peer_id_path())
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+
+    let (endpoint, fingerprint) =
+        match cli::receiver_advertisement(&config).map_err(error_to_string)? {
+            Some((address, cert)) => (Some(address), store::certificate_fingerprint(&cert)),
+            None => (None, String::new()),
+        };
+
+    let receiving = state
+        .jobs
+        .lock()
+        .map(|jobs| {
+            jobs.values().any(|job| {
+                job.kind == TransferJobKind::Receive && job.state == TransferJobState::Running
+            })
+        })
+        .unwrap_or(false);
+
+    let history = state.store.history();
+    let completed = history.iter().filter(|r| r.status == "completed").count() as u64;
+    let failed = history
+        .iter()
+        .filter(|r| r.status == "failed" || r.status == "interrupted")
+        .count() as u64;
+    let bytes_received: u64 = history
+        .iter()
+        .filter(|r| r.direction == "receive" && r.status == "completed")
+        .map(|r| r.size)
+        .sum();
+    let bytes_sent: u64 = history
+        .iter()
+        .filter(|r| r.direction == "send" && r.status == "completed")
+        .map(|r| r.size)
+        .sum();
+    let last_transfer = history
+        .first()
+        .map(|r| format!("{} {} · {}", r.direction, r.filename, r.status));
+
+    Ok(DiagnosticsResponse {
+        device_id,
+        certificate_fingerprint: fingerprint,
+        mdns_discoverable: prefs.discoverable,
+        receiver_running: receiving,
+        endpoint,
+        state_dir: path_to_string(config.state_dir.clone()),
+        download_dir: resolve_download_dir(&prefs.download_dir, &config.receive_dir)
+            .display()
+            .to_string(),
+        last_transfer,
+        total_transfers: history.len() as u64,
+        completed_transfers: completed,
+        failed_transfers: failed,
+        bytes_sent,
+        bytes_received,
+    })
+}
+
 pub fn build_config(app_handle: &tauri::AppHandle) -> CliConfig {
     let app_data_dir = app_handle
         .path()
@@ -1340,6 +1497,7 @@ pub fn run() {
             complete_onboarding,
             get_preferences,
             set_preferences,
+            get_diagnostics,
             discover_known_peers,
             start_receive,
             create_transfer_request,
@@ -1839,5 +1997,70 @@ mod tests {
         let ids = [TRAY_OPEN, TRAY_TOGGLE_RECEIVE, TRAY_SETTINGS, TRAY_QUIT];
         let unique: std::collections::HashSet<_> = ids.iter().collect();
         assert_eq!(unique.len(), ids.len());
+    }
+
+    fn trusted(id: &str) -> store::TrustedDevice {
+        store::TrustedDevice {
+            id: id.to_owned(),
+            display_name: id.to_owned(),
+            address: "10.0.0.5:41000".to_owned(),
+            platform: "linux".to_owned(),
+            fingerprint: "AAAA".to_owned(),
+            first_trusted: 1,
+            last_seen: 1,
+        }
+    }
+
+    #[test]
+    fn auto_accept_only_when_enabled_and_a_trusted_device_exists() {
+        let on = store::AppPreferences {
+            auto_accept_trusted: true,
+            ..store::AppPreferences::default()
+        };
+        let off = store::AppPreferences {
+            auto_accept_trusted: false,
+            ..store::AppPreferences::default()
+        };
+
+        // Case 3: unknown device / no trusted devices -> always prompt.
+        assert!(!should_auto_accept(&on, &[]));
+        // Case 2: trusted device present but setting off -> prompt.
+        assert!(!should_auto_accept(&off, &[trusted("dev-1")]));
+        // Case 1: setting on AND a trusted device exists -> auto-accept.
+        assert!(should_auto_accept(&on, &[trusted("dev-1")]));
+    }
+
+    #[test]
+    fn resolve_download_dir_uses_custom_when_writable_else_fallback() {
+        let fallback = temp_path("dl-fallback");
+        std::fs::create_dir_all(&fallback).expect("fallback dir");
+
+        // Empty preference -> fallback unchanged.
+        assert_eq!(resolve_download_dir("", &fallback), fallback);
+
+        // Custom dir that does not exist yet -> created and used (Task 2 case 2).
+        let custom = temp_path("dl-custom");
+        assert!(!custom.exists());
+        let resolved = resolve_download_dir(&custom.display().to_string(), &fallback);
+        assert_eq!(resolved, custom);
+        assert!(custom.is_dir(), "custom download dir is created");
+
+        std::fs::remove_dir_all(&fallback).ok();
+        std::fs::remove_dir_all(&custom).ok();
+    }
+
+    #[test]
+    fn resolve_download_dir_falls_back_when_path_is_a_file() {
+        let fallback = temp_path("dl-fb2");
+        std::fs::create_dir_all(&fallback).expect("fallback dir");
+        // A path that is a regular file cannot be a download dir -> fallback.
+        let file = temp_path("dl-not-a-dir");
+        std::fs::write(&file, b"x").expect("file");
+
+        let resolved = resolve_download_dir(&file.display().to_string(), &fallback);
+        assert_eq!(resolved, fallback);
+
+        std::fs::remove_file(&file).ok();
+        std::fs::remove_dir_all(&fallback).ok();
     }
 }
