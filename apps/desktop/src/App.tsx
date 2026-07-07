@@ -12,9 +12,12 @@ import {
 } from "./api/desktop";
 import { NAV, TITLES, type Screen } from "./screens/nav";
 import { Dashboard } from "./screens/Dashboard";
+import { DevicesScreen } from "./screens/DevicesScreen";
 import { SendScreen } from "./screens/SendScreen";
 import { ReceiveScreen } from "./screens/ReceiveScreen";
 import { MonitorScreen } from "./screens/MonitorScreen";
+import { HistoryScreen } from "./screens/HistoryScreen";
+import { TrustedScreen } from "./screens/TrustedScreen";
 import { StressScreen } from "./screens/StressScreen";
 import { SettingsScreen } from "./screens/SettingsScreen";
 
@@ -65,12 +68,18 @@ export default function App() {
 
   const renderScreen = () => {
     switch (screen) {
+      case "devices":
+        return <DevicesScreen />;
       case "send":
         return <SendScreen data={data} />;
       case "receive":
         return <ReceiveScreen data={data} />;
       case "monitor":
         return <MonitorScreen data={data} />;
+      case "history":
+        return <HistoryScreen />;
+      case "trusted":
+        return <TrustedScreen />;
       case "stress":
         return <StressScreen data={data} />;
       case "settings":

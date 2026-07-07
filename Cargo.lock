@@ -2303,6 +2303,7 @@ dependencies = [
  "engine",
  "networking",
  "serde",
+ "serde_json",
  "storage",
  "tauri",
  "tauri-build",

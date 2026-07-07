@@ -1,3 +1,5 @@
+mod store;
+
 use cli::{
     CliConfig, CliStatePaths, DiscoveredPeer, ReceiverEndpoint, TransferStatusSnapshot,
     build_transfer_request, discover_peers, receiver_endpoint, run_receive, run_send,
@@ -26,10 +28,13 @@ pub struct DesktopAppState {
     stress: Arc<Mutex<HashMap<u64, StressRun>>>,
     next_stress_id: AtomicU64,
     requests: Arc<Mutex<HashMap<String, PendingTransferRequest>>>,
+    store: Arc<store::AppStore>,
+    presence: Arc<Mutex<HashMap<String, PeerPresence>>>,
 }
 
 impl DesktopAppState {
     pub fn new(config: CliConfig) -> Self {
+        let store = Arc::new(store::AppStore::new(config.state_dir.clone()));
         Self {
             config,
             jobs: Arc::new(Mutex::new(HashMap::new())),
@@ -37,6 +42,8 @@ impl DesktopAppState {
             stress: Arc::new(Mutex::new(HashMap::new())),
             next_stress_id: AtomicU64::new(1),
             requests: Arc::new(Mutex::new(HashMap::new())),
+            store,
+            presence: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -51,6 +58,60 @@ impl DesktopAppState {
     fn next_stress_id(&self) -> u64 {
         self.next_stress_id.fetch_add(1, Ordering::Relaxed)
     }
+}
+
+/// A peer is considered "online" if it was seen within this window.
+const ONLINE_WINDOW_SECS: u64 = 12;
+
+/// Last-seen bookkeeping for a discovered peer, kept across discovery scans so
+/// online/offline transitions survive a peer briefly dropping out of a scan.
+#[derive(Debug, Clone)]
+struct PeerPresence {
+    display_name: String,
+    address: String,
+    platform: String,
+    last_seen: u64,
+}
+
+/// UI-facing device presence model (Feature 1).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerDevice {
+    pub id: String,
+    pub display_name: String,
+    pub address: String,
+    pub platform: String,
+    pub last_seen: u64,
+    pub online: bool,
+    pub trusted: bool,
+}
+
+/// Immutable facts about a transfer captured when its job is spawned, used to
+/// write a history record when the job finishes.
+#[derive(Debug, Clone)]
+struct TransferMeta {
+    direction: &'static str,
+    filename: String,
+    peer: String,
+}
+
+/// Extracts the total byte count from the last progress line the core printed,
+/// e.g. `sent: 1/1 chunks, 300000/300000 bytes` -> 300000.
+fn last_total_bytes(lines: &[String]) -> u64 {
+    for line in lines.iter().rev() {
+        let Some(index) = line.find(" bytes") else {
+            continue;
+        };
+        let Some(pair) = line[..index].rsplit(' ').next() else {
+            continue;
+        };
+        if let Some((_, total)) = pair.split_once('/')
+            && let Ok(value) = total.trim().parse::<u64>()
+        {
+            return value;
+        }
+    }
+    0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -451,6 +512,13 @@ fn start_receive(state: State<'_, DesktopAppState>) -> DesktopResult<StartJobRes
         state.jobs.clone(),
         job_id,
         TransferJobKind::Receive,
+        state.store.clone(),
+        config.clone(),
+        TransferMeta {
+            direction: "receive",
+            filename: "(incoming)".to_owned(),
+            peer: "incoming".to_owned(),
+        },
         move |output| run_receive(&config, output),
     );
 
@@ -512,6 +580,11 @@ fn approve_transfer_request(
     let config = state.config();
     let path = pending.file_path;
     let host = pending.host;
+    let meta = TransferMeta {
+        direction: "send",
+        filename: pending.response.file_name.clone(),
+        peer: pending.response.peer_address.clone(),
+    };
     let job_id = state.next_job_id();
     insert_job(
         &state.jobs,
@@ -522,6 +595,9 @@ fn approve_transfer_request(
         state.jobs.clone(),
         job_id,
         TransferJobKind::Send,
+        state.store.clone(),
+        config.clone(),
+        meta,
         move |output| run_send(&path, host, &config, output),
     );
 
@@ -533,11 +609,25 @@ fn reject_transfer_request(
     request_id: String,
     state: State<'_, DesktopAppState>,
 ) -> DesktopResult<()> {
-    state
+    let pending = state
         .requests
         .lock()
         .map_err(|_| "desktop request registry is unavailable".to_owned())?
         .remove(&request_id);
+    // Feature 4: a rejected request is a cancelled transfer in history.
+    if let Some(pending) = pending {
+        state.store.record_transfer(store::TransferRecord {
+            id: pending.response.id.clone(),
+            filename: pending.response.file_name.clone(),
+            size: pending.response.file_size,
+            direction: "send".to_owned(),
+            peer: pending.response.peer_address.clone(),
+            timestamp: store::unix_now(),
+            status: "cancelled".to_owned(),
+            duration_ms: 0,
+            checksum_ok: false,
+        });
+    }
     Ok(())
 }
 
@@ -553,6 +643,166 @@ fn list_transfer_requests(
         .values()
         .map(|pending| pending.response.clone())
         .collect())
+}
+
+// ---- Feature 1: device presence ------------------------------------------
+
+/// Runs one discovery scan, folds it into persistent presence, and returns the
+/// device list (discovered + recently-seen + trusted-but-offline). Uses the
+/// existing mDNS discovery unchanged as the source.
+#[tauri::command]
+fn list_devices(state: State<'_, DesktopAppState>) -> DesktopResult<Vec<PeerDevice>> {
+    let config = state.config();
+    let discovered = discover_peers(&config).map_err(error_to_string)?;
+    let now = store::unix_now();
+
+    let mut presence = state
+        .presence
+        .lock()
+        .map_err(|_| "desktop presence registry is unavailable".to_owned())?;
+    let mut seen_addresses = Vec::new();
+    for peer in &discovered {
+        let address = peer
+            .addresses
+            .first()
+            .map(|address| format!("{address}:{}", peer.port))
+            .unwrap_or_default();
+        seen_addresses.push(address.clone());
+        presence.insert(
+            peer.peer_id.clone(),
+            PeerPresence {
+                display_name: peer.display_name.clone(),
+                address,
+                platform: "unknown".to_owned(),
+                last_seen: now,
+            },
+        );
+    }
+    drop(presence);
+
+    // Keep trusted-device last_seen fresh for the ones currently visible.
+    state.store.touch_last_seen(&seen_addresses, now);
+    let trusted = state.store.trusted_devices();
+
+    let presence = state
+        .presence
+        .lock()
+        .map_err(|_| "desktop presence registry is unavailable".to_owned())?;
+    let mut devices: Vec<PeerDevice> = presence
+        .iter()
+        .map(|(id, entry)| {
+            let trusted_entry = trusted
+                .iter()
+                .find(|device| device.address == entry.address);
+            PeerDevice {
+                id: id.clone(),
+                display_name: trusted_entry
+                    .map(|device| device.display_name.clone())
+                    .unwrap_or_else(|| entry.display_name.clone()),
+                address: entry.address.clone(),
+                platform: entry.platform.clone(),
+                last_seen: entry.last_seen,
+                online: now.saturating_sub(entry.last_seen) <= ONLINE_WINDOW_SECS,
+                trusted: trusted_entry.is_some(),
+            }
+        })
+        .collect();
+
+    // Trusted devices not currently visible still appear, as offline.
+    for device in &trusted {
+        if !devices.iter().any(|known| known.address == device.address) {
+            devices.push(PeerDevice {
+                id: device.id.clone(),
+                display_name: device.display_name.clone(),
+                address: device.address.clone(),
+                platform: device.platform.clone(),
+                last_seen: device.last_seen,
+                online: false,
+                trusted: true,
+            });
+        }
+    }
+
+    devices.sort_by(|a, b| {
+        b.online
+            .cmp(&a.online)
+            .then_with(|| a.display_name.cmp(&b.display_name))
+    });
+    Ok(devices)
+}
+
+// ---- Feature 2: trusted devices ------------------------------------------
+
+#[tauri::command]
+fn list_trusted_devices(
+    state: State<'_, DesktopAppState>,
+) -> DesktopResult<Vec<store::TrustedDevice>> {
+    Ok(state.store.trusted_devices())
+}
+
+/// Trusts a device by recording UI metadata over its *existing* certificate.
+/// We can only fingerprint a device whose certificate we already hold (the
+/// `receiver.peer` anchor), so trust cannot be fabricated for an unknown peer.
+#[tauri::command]
+fn trust_device(
+    id: String,
+    display_name: String,
+    address: String,
+    platform: Option<String>,
+    state: State<'_, DesktopAppState>,
+) -> DesktopResult<store::TrustedDevice> {
+    let advertisement = cli::receiver_advertisement(&state.config()).map_err(error_to_string)?;
+    let fingerprint = match advertisement {
+        Some((advert_address, certificate_der)) if advert_address == address => {
+            store::certificate_fingerprint(&certificate_der)
+        }
+        _ => {
+            return Err(
+                "no certificate is held for this device yet — receive from or send to it first \
+                 to establish trust"
+                    .to_owned(),
+            );
+        }
+    };
+
+    Ok(state.store.trust_device(store::TrustedDevice {
+        id,
+        display_name,
+        address,
+        platform: platform.unwrap_or_else(|| "unknown".to_owned()),
+        fingerprint,
+        first_trusted: 0,
+        last_seen: store::unix_now(),
+    }))
+}
+
+#[tauri::command]
+fn untrust_device(id: String, state: State<'_, DesktopAppState>) -> DesktopResult<bool> {
+    Ok(state.store.untrust_device(&id))
+}
+
+#[tauri::command]
+fn rename_trusted_device(
+    id: String,
+    display_name: String,
+    state: State<'_, DesktopAppState>,
+) -> DesktopResult<bool> {
+    Ok(state.store.rename_trusted_device(&id, &display_name))
+}
+
+// ---- Feature 4: transfer history -----------------------------------------
+
+#[tauri::command]
+fn list_transfer_history(
+    state: State<'_, DesktopAppState>,
+) -> DesktopResult<Vec<store::TransferRecord>> {
+    Ok(state.store.history())
+}
+
+#[tauri::command]
+fn clear_transfer_history(state: State<'_, DesktopAppState>) -> DesktopResult<()> {
+    state.store.clear_history();
+    Ok(())
 }
 
 #[tauri::command]
@@ -660,6 +910,13 @@ pub fn run() {
             approve_transfer_request,
             reject_transfer_request,
             list_transfer_requests,
+            list_devices,
+            list_trusted_devices,
+            trust_device,
+            untrust_device,
+            rename_trusted_device,
+            list_transfer_history,
+            clear_transfer_history,
             list_transfer_jobs,
             reset_completed_jobs,
             start_stress_run,
@@ -670,15 +927,20 @@ pub fn run() {
         .expect("failed to run Nexo desktop");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_transfer_job<F>(
     jobs: Arc<Mutex<HashMap<u64, TransferJob>>>,
     job_id: u64,
     kind: TransferJobKind,
+    store: Arc<store::AppStore>,
+    config: CliConfig,
+    meta: TransferMeta,
     work: F,
 ) where
     F: FnOnce(&mut JobOutput) -> cli::CliResult<()> + Send + 'static,
 {
     thread::spawn(move || {
+        let started = std::time::Instant::now();
         let mut output = JobOutput::new(jobs.clone(), job_id);
         let result = work(&mut output);
         let lines = output.lines();
@@ -686,6 +948,30 @@ fn spawn_transfer_job<F>(
             Ok(()) => (TransferJobState::Completed, None),
             Err(error) => (TransferJobState::Failed, Some(error.to_string())),
         };
+
+        // Feature 4: application-level transfer history (does not touch the
+        // storage engine). Recorded from the job's own outcome + output.
+        let completed = state == TransferJobState::Completed;
+        let filename = if meta.direction == "receive" {
+            transfer_status_snapshot(&config)
+                .ok()
+                .and_then(|snapshot| snapshot.latest)
+                .and_then(|latest| latest.file_name)
+                .unwrap_or(meta.filename)
+        } else {
+            meta.filename
+        };
+        store.record_transfer(store::TransferRecord {
+            id: format!("job-{job_id}"),
+            filename,
+            size: last_total_bytes(&lines),
+            direction: meta.direction.to_owned(),
+            peer: meta.peer,
+            timestamp: store::unix_now(),
+            status: if completed { "completed" } else { "failed" }.to_owned(),
+            duration_ms: started.elapsed().as_millis() as u64,
+            checksum_ok: completed,
+        });
 
         if let Ok(mut jobs) = jobs.lock() {
             jobs.insert(

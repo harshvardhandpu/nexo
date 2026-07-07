@@ -693,6 +693,18 @@ pub fn receiver_endpoint(config: &CliConfig) -> CliResult<Option<ReceiverEndpoin
     }))
 }
 
+/// The trusted receiver's advertised address and certificate DER, if one has
+/// been recorded. Read-only accessor over the existing `receiver.peer` trust
+/// anchor — used by the desktop layer to fingerprint a device without changing
+/// the trust system.
+pub fn receiver_advertisement(config: &CliConfig) -> CliResult<Option<(String, Vec<u8>)>> {
+    if !config.receiver_peer_path().exists() {
+        return Ok(None);
+    }
+    let advert = load_receiver_advert(config)?;
+    Ok(Some((advert.address.to_string(), advert.certificate_der)))
+}
+
 pub fn transfer_status_snapshot(config: &CliConfig) -> CliResult<TransferStatusSnapshot> {
     let Some(latest) = load_latest(config)? else {
         return Ok(TransferStatusSnapshot { latest: None });

@@ -142,6 +142,78 @@ export function listTransferRequests() {
   return invoke<TransferRequest[]>("list_transfer_requests");
 }
 
+// ---- Phase 2: presence, trust, history -----------------------------------
+
+export type PeerDevice = {
+  id: string;
+  displayName: string;
+  address: string;
+  platform: string;
+  lastSeen: number;
+  online: boolean;
+  trusted: boolean;
+};
+
+export type TrustedDevice = {
+  id: string;
+  displayName: string;
+  address: string;
+  platform: string;
+  fingerprint: string;
+  firstTrusted: number;
+  lastSeen: number;
+};
+
+export type TransferRecord = {
+  id: string;
+  filename: string;
+  size: number;
+  direction: string;
+  peer: string;
+  timestamp: number;
+  status: string;
+  durationMs: number;
+  checksumOk: boolean;
+};
+
+export function listDevices() {
+  return invoke<PeerDevice[]>("list_devices");
+}
+
+export function listTrustedDevices() {
+  return invoke<TrustedDevice[]>("list_trusted_devices");
+}
+
+export function trustDevice(
+  id: string,
+  displayName: string,
+  address: string,
+  platform?: string,
+) {
+  return invoke<TrustedDevice>("trust_device", {
+    id,
+    displayName,
+    address,
+    platform: platform || null,
+  });
+}
+
+export function untrustDevice(id: string) {
+  return invoke<boolean>("untrust_device", { id });
+}
+
+export function renameTrustedDevice(id: string, displayName: string) {
+  return invoke<boolean>("rename_trusted_device", { id, displayName });
+}
+
+export function listTransferHistory() {
+  return invoke<TransferRecord[]>("list_transfer_history");
+}
+
+export function clearTransferHistory() {
+  return invoke<void>("clear_transfer_history");
+}
+
 export function listTransferJobs() {
   return invoke<TransferJob[]>("list_transfer_jobs");
 }

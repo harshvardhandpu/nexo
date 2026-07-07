@@ -23,5 +23,6 @@ networking = { path = "../../../crates/networking" }
 crypto = { path = "../../../crates/crypto" }
 storage = { path = "../../../crates/storage" }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tauri = { version = "2", features = [] }
 time = { workspace = true }
