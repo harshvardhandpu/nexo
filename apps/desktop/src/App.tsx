@@ -1,9 +1,15 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { AlertTriangle, Wifi, WifiOff } from "lucide-react";
 import { Sidebar } from "./components/Sidebar";
 import { TopBar } from "./components/TopBar";
+import { ConfirmDialog } from "./components/ConfirmDialog";
 import { Banner, StatusPill } from "./components/ui";
 import { useDesktopData } from "./lib/useDesktopData";
+import {
+  TRANSFER_REQUEST_EVENT,
+  type TransferRequest,
+} from "./api/desktop";
 import { NAV, TITLES, type Screen } from "./screens/nav";
 import { Dashboard } from "./screens/Dashboard";
 import { SendScreen } from "./screens/SendScreen";
@@ -15,6 +21,44 @@ import { SettingsScreen } from "./screens/SettingsScreen";
 export default function App() {
   const [screen, setScreen] = useState<Screen>("dashboard");
   const data = useDesktopData();
+  const [pendingRequest, setPendingRequest] = useState<TransferRequest | null>(
+    null,
+  );
+  const [confirmBusy, setConfirmBusy] = useState(false);
+
+  // AirDrop: the backend emits `transfer_request_created` for every send intent.
+  // We show the mandatory confirmation modal; no transfer runs until approved.
+  useEffect(() => {
+    const unlisten = listen<TransferRequest>(TRANSFER_REQUEST_EVENT, (event) => {
+      setPendingRequest(event.payload);
+    });
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  const approve = async () => {
+    if (!pendingRequest) return;
+    setConfirmBusy(true);
+    try {
+      await data.approveRequest(pendingRequest.id);
+      setPendingRequest(null);
+      setScreen("monitor");
+    } finally {
+      setConfirmBusy(false);
+    }
+  };
+
+  const reject = async () => {
+    if (!pendingRequest) return;
+    setConfirmBusy(true);
+    try {
+      await data.rejectRequest(pendingRequest.id);
+    } finally {
+      setPendingRequest(null);
+      setConfirmBusy(false);
+    }
+  };
 
   const activeCount = data.jobs.filter((job) => job.state === "running").length;
   const meta = TITLES[screen];
@@ -22,7 +66,7 @@ export default function App() {
   const renderScreen = () => {
     switch (screen) {
       case "send":
-        return <SendScreen data={data} onNavigate={setScreen} />;
+        return <SendScreen data={data} />;
       case "receive":
         return <ReceiveScreen data={data} />;
       case "monitor":
@@ -74,6 +118,14 @@ export default function App() {
           {renderScreen()}
         </div>
       </main>
+      {pendingRequest ? (
+        <ConfirmDialog
+          request={pendingRequest}
+          busy={confirmBusy}
+          onApprove={approve}
+          onReject={reject}
+        />
+      ) : null}
     </div>
   );
 }

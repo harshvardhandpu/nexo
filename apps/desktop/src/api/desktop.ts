@@ -103,11 +103,43 @@ export function startReceive() {
   return invoke<StartJobResponse>("start_receive");
 }
 
-export function startSend(filePath: string, host?: string) {
-  return invoke<StartJobResponse>("start_send", {
+export type TransferRequest = {
+  id: string;
+  filePath: string;
+  fileName: string;
+  fileSize: number;
+  peerDisplayName: string;
+  peerAddress: string;
+  status: string;
+};
+
+/** Event name the backend emits when a request needs confirmation. */
+export const TRANSFER_REQUEST_EVENT = "transfer_request_created";
+
+/**
+ * AirDrop step 1: create a *pending* transfer request. This does NOT start a
+ * transfer — the backend also emits `transfer_request_created` so the UI shows
+ * the mandatory confirmation modal. Transfer only begins after approve().
+ */
+export function createTransferRequest(filePath: string, host?: string) {
+  return invoke<TransferRequest>("create_transfer_request", {
     filePath,
     host: host || null,
   });
+}
+
+/** AirDrop step 2a: user approved — start the real transfer. */
+export function approveTransferRequest(requestId: string) {
+  return invoke<StartJobResponse>("approve_transfer_request", { requestId });
+}
+
+/** AirDrop step 2b: user cancelled — drop the pending request, no transfer. */
+export function rejectTransferRequest(requestId: string) {
+  return invoke<void>("reject_transfer_request", { requestId });
+}
+
+export function listTransferRequests() {
+  return invoke<TransferRequest[]>("list_transfer_requests");
 }
 
 export function listTransferJobs() {

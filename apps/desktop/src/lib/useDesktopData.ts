@@ -17,7 +17,9 @@ import {
   resetCompletedJobs,
   resetCompletedStressRuns,
   startReceive,
-  startSend,
+  approveTransferRequest,
+  createTransferRequest,
+  rejectTransferRequest,
   startStressRun,
 } from "../api/desktop";
 
@@ -36,7 +38,9 @@ export type DesktopData = {
   error: string | null;
   ready: boolean;
   refreshPeers: () => Promise<void>;
-  send: (filePath: string, host?: string) => Promise<void>;
+  requestSend: (filePath: string, host?: string) => Promise<void>;
+  approveRequest: (requestId: string) => Promise<void>;
+  rejectRequest: (requestId: string) => Promise<void>;
   receive: () => Promise<void>;
   startStress: (
     filePath: string,
@@ -124,13 +128,27 @@ export function useDesktopData(): DesktopData {
     }
   }, []);
 
-  const send = useCallback(
+  const requestSend = useCallback(
     async (filePath: string, host?: string) => {
-      await startSend(filePath, host);
+      // Creates a PENDING request and emits transfer_request_created; the modal
+      // (driven by the App-level event listener) handles approve/reject. No
+      // transfer starts here.
+      await createTransferRequest(filePath, host);
+    },
+    [],
+  );
+
+  const approveRequest = useCallback(
+    async (requestId: string) => {
+      await approveTransferRequest(requestId);
       await pollLive();
     },
     [pollLive],
   );
+
+  const rejectRequest = useCallback(async (requestId: string) => {
+    await rejectTransferRequest(requestId);
+  }, []);
 
   const receive = useCallback(async () => {
     await startReceive();
@@ -168,7 +186,9 @@ export function useDesktopData(): DesktopData {
     error,
     ready,
     refreshPeers,
-    send,
+    requestSend,
+    approveRequest,
+    rejectRequest,
     receive,
     startStress,
     clearJobs,

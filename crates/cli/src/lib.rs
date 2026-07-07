@@ -55,6 +55,10 @@ enum CliCommand {
         file: PathBuf,
         #[arg(long)]
         host: Option<SocketAddr>,
+        /// Skip the interactive "Device found" confirmation and send immediately.
+        /// Intended for scripting/testing only; the default requires consent.
+        #[arg(long)]
+        auto_accept: bool,
     },
     Status,
 }
@@ -180,7 +184,11 @@ pub fn run_cli<W: Write>(args: CliArgs, config: &CliConfig, output: &mut W) -> C
     match args.command {
         CliCommand::Discover => run_discover(config, output),
         CliCommand::Receive => run_receive(config, output),
-        CliCommand::Send { file, host } => run_send(&file, host, config, output),
+        CliCommand::Send {
+            file,
+            host,
+            auto_accept,
+        } => run_send_gated(&file, host, auto_accept, config, output),
         CliCommand::Status => run_status(config, output),
     }
 }
@@ -366,6 +374,164 @@ pub fn run_receive<W: Write>(config: &CliConfig, output: &mut W) -> CliResult<()
     )?;
 
     Ok(())
+}
+
+/// AirDrop-mode transfer status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AirdropRequestStatus {
+    Pending,
+    Approved,
+    Rejected,
+}
+
+/// An intent to send a file to a specific discovered/known receiver, created
+/// *before* any bytes move. A transfer only starts once this request is
+/// explicitly approved (interactive terminal prompt, `--auto-accept`, or a UI
+/// approve action), never automatically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AirdropRequest {
+    pub id: String,
+    pub file_path: PathBuf,
+    pub file_name: String,
+    pub file_size: u64,
+    pub peer_display_name: String,
+    pub peer_address: SocketAddr,
+    pub status: AirdropRequestStatus,
+}
+
+/// How a send should obtain consent before transferring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendConsent {
+    /// Ask the user on the interactive terminal (default AirDrop behavior).
+    Interactive,
+    /// Pre-approved (`--auto-accept`, or a UI that already confirmed). No
+    /// automatic transfer path exists that does not pass through here.
+    AutoAccept,
+}
+
+/// Resolves and trust-checks the destination for a send, then builds a pending
+/// [`TransferRequest`]. This performs the *same* certificate-trust check as
+/// [`run_send`] (an untrusted address is rejected here too), so confirmation is
+/// only ever offered for a receiver whose certificate we already hold.
+pub fn build_transfer_request(
+    file: &Path,
+    host: Option<SocketAddr>,
+    config: &CliConfig,
+) -> CliResult<AirdropRequest> {
+    let advert = load_receiver_advert(config)?;
+    let address = host.unwrap_or(advert.address);
+    if address != advert.address {
+        return Err(io_error(
+            ErrorKind::NotFound,
+            format!("no trusted receiver certificate is stored for {address}"),
+        ));
+    }
+    if !file.is_file() {
+        return Err(io_error(
+            ErrorKind::NotFound,
+            format!("file does not exist: {}", file.display()),
+        ));
+    }
+    let file_size = fs::metadata(file)?.len();
+    let file_name = file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file")
+        .to_owned();
+
+    Ok(AirdropRequest {
+        id: format!("req-{}", hex_encode(&random_request_id())),
+        file_path: file.to_path_buf(),
+        file_name,
+        file_size,
+        peer_display_name: address.to_string(),
+        peer_address: address,
+        status: AirdropRequestStatus::Pending,
+    })
+}
+
+/// Consent-gated send: the ONLY path the CLI uses to send. It builds a transfer
+/// request, obtains explicit approval, and only then delegates to the unchanged
+/// [`run_send`] executor. No approval => no transfer.
+pub fn run_send_gated<W: Write>(
+    file: &Path,
+    host: Option<SocketAddr>,
+    auto_accept: bool,
+    config: &CliConfig,
+    output: &mut W,
+) -> CliResult<()> {
+    let consent = if auto_accept {
+        SendConsent::AutoAccept
+    } else {
+        SendConsent::Interactive
+    };
+    let request = build_transfer_request(file, host, config)?;
+    write_transfer_request_prompt(&request, output)?;
+
+    let approved = match consent {
+        SendConsent::AutoAccept => {
+            writeln!(output, "auto-accept: approved {}", request.id)?;
+            true
+        }
+        SendConsent::Interactive => confirm_on_terminal(&request)?,
+    };
+
+    if !approved {
+        writeln!(output, "transfer cancelled: {}", request.id)?;
+        return Ok(());
+    }
+
+    writeln!(output, "transfer approved: {}", request.id)?;
+    run_send(
+        &request.file_path,
+        Some(request.peer_address),
+        config,
+        output,
+    )
+}
+
+/// Renders the mandatory "Device found" confirmation summary. Shared by the
+/// terminal prompt and mirrored by the desktop modal.
+fn write_transfer_request_prompt<W: Write>(
+    request: &AirdropRequest,
+    output: &mut W,
+) -> CliResult<()> {
+    writeln!(output, "Device found")?;
+    writeln!(output, "  Device: {}", request.peer_display_name)?;
+    writeln!(output, "  Endpoint: {}", request.peer_address)?;
+    writeln!(
+        output,
+        "  File: {} ({} bytes)",
+        request.file_name, request.file_size
+    )?;
+    Ok(())
+}
+
+/// Blocking y/n confirmation on the controlling terminal. Any non-`y` answer
+/// (including EOF/non-interactive stdin) is treated as a rejection, so a
+/// non-interactive `send` without `--auto-accept` never transfers by accident.
+fn confirm_on_terminal(request: &AirdropRequest) -> CliResult<bool> {
+    use std::io::Write as _;
+    print!(
+        "Send {} to {}? [y/N] ",
+        request.file_name, request.peer_address
+    );
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    let read = std::io::stdin().read_line(&mut answer)?;
+    if read == 0 {
+        return Ok(false);
+    }
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn random_request_id() -> [u8; 8] {
+    let mut bytes = [0u8; 8];
+    OsRng.fill_bytes(&mut bytes);
+    bytes
 }
 
 pub fn run_send<W: Write>(
@@ -1403,6 +1569,100 @@ mod tests {
     }
 
     #[test]
+    fn build_transfer_request_rejects_untrusted_host() {
+        // Consent must never be offered for a host we do not already trust:
+        // build_transfer_request enforces the same cert-trust check as run_send.
+        let config = test_config("airdrop-untrusted");
+        fs::create_dir_all(&config.state_dir).expect("state dir");
+        let advert = ReceiverAdvert {
+            address: "127.0.0.1:41000".parse().expect("addr"),
+            certificate_der: vec![1, 2, 3],
+        };
+        save_receiver_advert(&config, &advert).expect("advert");
+        let file = config.state_dir.join("payload.bin");
+        fs::write(&file, b"hello").expect("file");
+
+        let error = build_transfer_request(
+            &file,
+            Some("127.0.0.1:49999".parse().expect("addr")),
+            &config,
+        )
+        .expect_err("untrusted host must be rejected before any confirmation");
+        assert!(
+            error
+                .to_string()
+                .contains("no trusted receiver certificate")
+        );
+    }
+
+    #[test]
+    fn build_transfer_request_is_pending_with_file_and_peer_metadata() {
+        let config = test_config("airdrop-pending");
+        fs::create_dir_all(&config.state_dir).expect("state dir");
+        let address: SocketAddr = "127.0.0.1:41234".parse().expect("addr");
+        save_receiver_advert(
+            &config,
+            &ReceiverAdvert {
+                address,
+                certificate_der: vec![9, 9, 9],
+            },
+        )
+        .expect("advert");
+        let file = config.state_dir.join("movie.bin");
+        fs::write(&file, vec![0u8; 2048]).expect("file");
+
+        let request = build_transfer_request(&file, None, &config).expect("request");
+
+        assert_eq!(request.status, AirdropRequestStatus::Pending);
+        assert_eq!(request.peer_address, address);
+        assert_eq!(request.file_name, "movie.bin");
+        assert_eq!(request.file_size, 2048);
+        assert!(request.id.starts_with("req-"));
+    }
+
+    #[test]
+    fn send_without_auto_accept_and_no_terminal_does_not_transfer() {
+        // The default (non-interactive stdin, no --auto-accept) must NOT start a
+        // transfer: confirm_on_terminal sees EOF and treats it as a rejection.
+        // This proves "no automatic transfers" even when the receiver is trusted.
+        let workspace = TempWorkspace::new("airdrop-no-consent");
+        let source = workspace.path("source.txt");
+        let state_dir = workspace.path("state");
+        fs::create_dir_all(&state_dir).expect("state dir");
+        fs::write(&source, b"nexo airdrop consent gate").expect("source");
+        let config = CliConfig {
+            state_dir: state_dir.clone(),
+            receive_dir: workspace.path("received"),
+            chunk_size: 8,
+        };
+        // A trusted receiver advert exists, but nothing is listening: if a
+        // transfer were (wrongly) attempted it would try to connect and block or
+        // error; a correct rejection returns Ok without connecting.
+        save_receiver_advert(
+            &config,
+            &ReceiverAdvert {
+                address: "127.0.0.1:1".parse().expect("addr"),
+                certificate_der: vec![1],
+            },
+        )
+        .expect("advert");
+
+        let mut output = Vec::new();
+        run_send_gated(&source, None, false, &config, &mut output).expect("gated send returns");
+        let text = String::from_utf8(output).expect("utf8");
+
+        assert!(
+            text.contains("Device found"),
+            "must show confirmation: {text}"
+        );
+        assert!(text.contains("transfer cancelled"), "must cancel: {text}");
+        assert!(
+            !text.contains("transfer complete"),
+            "must not transfer: {text}"
+        );
+    }
+
+    #[test]
     fn send_and_receive_transfer_file_over_quic() {
         let workspace = TempWorkspace::new("quic-cli");
         let source = workspace.path("source.txt");
@@ -1429,7 +1689,13 @@ mod tests {
         let advert = load_receiver_advert(&config).expect("receiver advert");
         let mut send_output = Vec::new();
 
-        let send_result = run_send(&source, Some(advert.address), &config, &mut send_output);
+        let send_result = run_send_gated(
+            &source,
+            Some(advert.address),
+            true,
+            &config,
+            &mut send_output,
+        );
         let receive_result = receiver.join().expect("receiver thread");
         if let Err(error) = send_result {
             panic!("send failed: {error}; receiver result: {receive_result:?}");

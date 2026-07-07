@@ -1,7 +1,6 @@
 import { useCallback, useState } from "react";
 import { FileUp, Send, Server, UploadCloud } from "lucide-react";
 import type { DesktopData } from "../lib/useDesktopData";
-import type { Screen } from "./nav";
 import { useFileDrop } from "../lib/dragdrop";
 import { JobCard } from "../components/JobCard";
 import {
@@ -14,13 +13,7 @@ import {
 } from "../components/ui";
 import { fileName } from "../utils";
 
-export function SendScreen({
-  data,
-  onNavigate,
-}: {
-  data: DesktopData;
-  onNavigate: (screen: Screen) => void;
-}) {
+export function SendScreen({ data }: { data: DesktopData }) {
   const [filePath, setFilePath] = useState("");
   const [host, setHost] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -45,8 +38,10 @@ export function SendScreen({
     }
     setSubmitting(true);
     try {
-      await data.send(path, host.trim() || data.receiver?.address);
-      onNavigate("monitor");
+      // AirDrop: create a pending request. The backend emits an event and the
+      // App-level confirmation modal handles approve/reject — no transfer starts
+      // until the user confirms.
+      await data.requestSend(path, host.trim() || data.receiver?.address);
     } catch (cause) {
       setError(String(cause));
     } finally {
@@ -118,7 +113,7 @@ export function SendScreen({
               loading={submitting}
               disabled={!filePath.trim()}
             >
-              Start transfer
+              Find device
             </NeonButton>
           </div>
         </div>

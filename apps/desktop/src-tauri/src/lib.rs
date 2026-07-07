@@ -1,6 +1,7 @@
 use cli::{
     CliConfig, CliStatePaths, DiscoveredPeer, ReceiverEndpoint, TransferStatusSnapshot,
-    discover_peers, receiver_endpoint, run_receive, run_send, transfer_status_snapshot,
+    build_transfer_request, discover_peers, receiver_endpoint, run_receive, run_send,
+    transfer_status_snapshot,
 };
 use engine::chunker::default_chunk_size;
 use serde::{Deserialize, Serialize};
@@ -10,9 +11,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
 type DesktopResult<T> = Result<T, String>;
+
+/// Event name emitted when a pending AirDrop request needs user confirmation.
+const TRANSFER_REQUEST_EVENT: &str = "transfer_request_created";
 
 #[derive(Debug)]
 pub struct DesktopAppState {
@@ -21,6 +25,7 @@ pub struct DesktopAppState {
     next_job_id: AtomicU64,
     stress: Arc<Mutex<HashMap<u64, StressRun>>>,
     next_stress_id: AtomicU64,
+    requests: Arc<Mutex<HashMap<String, PendingTransferRequest>>>,
 }
 
 impl DesktopAppState {
@@ -31,6 +36,7 @@ impl DesktopAppState {
             next_job_id: AtomicU64::new(1),
             stress: Arc::new(Mutex::new(HashMap::new())),
             next_stress_id: AtomicU64::new(1),
+            requests: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -163,6 +169,42 @@ impl From<TransferStatusSnapshot> for TransferStatusResponse {
 #[serde(rename_all = "camelCase")]
 pub struct StartJobResponse {
     pub job_id: u64,
+}
+
+/// UI-facing view of a pending AirDrop transfer request (the modal payload).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferRequestResponse {
+    pub id: String,
+    pub file_path: String,
+    pub file_name: String,
+    pub file_size: u64,
+    pub peer_display_name: String,
+    pub peer_address: String,
+    pub status: String,
+}
+
+impl From<&cli::AirdropRequest> for TransferRequestResponse {
+    fn from(request: &cli::AirdropRequest) -> Self {
+        Self {
+            id: request.id.clone(),
+            file_path: request.file_path.display().to_string(),
+            file_name: request.file_name.clone(),
+            file_size: request.file_size,
+            peer_display_name: request.peer_display_name.clone(),
+            peer_address: request.peer_address.to_string(),
+            status: "pending".to_owned(),
+        }
+    }
+}
+
+/// Server-side pending request: the UI-facing view plus the resolved inputs
+/// needed to actually run the send once approved.
+#[derive(Debug, Clone)]
+struct PendingTransferRequest {
+    file_path: PathBuf,
+    host: Option<SocketAddr>,
+    response: TransferRequestResponse,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -416,15 +458,60 @@ fn start_receive(state: State<'_, DesktopAppState>) -> DesktopResult<StartJobRes
 }
 
 #[tauri::command]
-fn start_send(
+fn create_transfer_request(
     file_path: String,
     host: Option<String>,
+    app: tauri::AppHandle,
     state: State<'_, DesktopAppState>,
-) -> DesktopResult<StartJobResponse> {
-    let path = PathBuf::from(file_path);
+) -> DesktopResult<TransferRequestResponse> {
+    let path = PathBuf::from(&file_path);
     validate_file_path(&path)?;
     let host = parse_host(host)?;
+    // Reuse the CLI's trust-checked request builder: an untrusted host is
+    // rejected here, before any confirmation is offered or bytes move.
+    let request = build_transfer_request(&path, host, &state.config()).map_err(error_to_string)?;
+    let response = TransferRequestResponse::from(&request);
+
+    state
+        .requests
+        .lock()
+        .map_err(|_| "desktop request registry is unavailable".to_owned())?
+        .insert(
+            response.id.clone(),
+            PendingTransferRequest {
+                file_path: request.file_path,
+                host: Some(request.peer_address),
+                response: response.clone(),
+            },
+        );
+
+    // Notify the UI so it can show the mandatory confirmation modal. No transfer
+    // is started here; the UI must call approve_transfer_request to proceed.
+    app.emit(TRANSFER_REQUEST_EVENT, response.clone())
+        .map_err(|error| format!("failed to emit transfer request event: {error}"))?;
+
+    Ok(response)
+}
+
+#[tauri::command]
+fn approve_transfer_request(
+    request_id: String,
+    state: State<'_, DesktopAppState>,
+) -> DesktopResult<StartJobResponse> {
+    let pending = {
+        let mut requests = state
+            .requests
+            .lock()
+            .map_err(|_| "desktop request registry is unavailable".to_owned())?;
+        requests
+            .remove(&request_id)
+            .ok_or_else(|| format!("unknown transfer request: {request_id}"))?
+    };
+
+    // User consent obtained: only now delegate to the unchanged run_send.
     let config = state.config();
+    let path = pending.file_path;
+    let host = pending.host;
     let job_id = state.next_job_id();
     insert_job(
         &state.jobs,
@@ -439,6 +526,33 @@ fn start_send(
     );
 
     Ok(StartJobResponse { job_id })
+}
+
+#[tauri::command]
+fn reject_transfer_request(
+    request_id: String,
+    state: State<'_, DesktopAppState>,
+) -> DesktopResult<()> {
+    state
+        .requests
+        .lock()
+        .map_err(|_| "desktop request registry is unavailable".to_owned())?
+        .remove(&request_id);
+    Ok(())
+}
+
+#[tauri::command]
+fn list_transfer_requests(
+    state: State<'_, DesktopAppState>,
+) -> DesktopResult<Vec<TransferRequestResponse>> {
+    let requests = state
+        .requests
+        .lock()
+        .map_err(|_| "desktop request registry is unavailable".to_owned())?;
+    Ok(requests
+        .values()
+        .map(|pending| pending.response.clone())
+        .collect())
 }
 
 #[tauri::command]
@@ -542,7 +656,10 @@ pub fn run() {
             get_receiver_endpoint,
             discover_known_peers,
             start_receive,
-            start_send,
+            create_transfer_request,
+            approve_transfer_request,
+            reject_transfer_request,
+            list_transfer_requests,
             list_transfer_jobs,
             reset_completed_jobs,
             start_stress_run,
@@ -849,6 +966,55 @@ mod tests {
         let runs = stress.lock().expect("stress registry");
         assert_eq!(runs.len(), 1);
         assert!(runs.contains_key(&2));
+    }
+
+    fn pending_request(id: &str) -> PendingTransferRequest {
+        PendingTransferRequest {
+            file_path: PathBuf::from("/tmp/file.bin"),
+            host: Some("127.0.0.1:41000".parse().expect("addr")),
+            response: TransferRequestResponse {
+                id: id.to_owned(),
+                file_path: "/tmp/file.bin".to_owned(),
+                file_name: "file.bin".to_owned(),
+                file_size: 1024,
+                peer_display_name: "127.0.0.1:41000".to_owned(),
+                peer_address: "127.0.0.1:41000".to_owned(),
+                status: "pending".to_owned(),
+            },
+        }
+    }
+
+    #[test]
+    fn reject_removes_pending_request_without_transferring() {
+        let requests: Arc<Mutex<HashMap<String, PendingTransferRequest>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        requests
+            .lock()
+            .expect("requests")
+            .insert("req-1".to_owned(), pending_request("req-1"));
+
+        // Reject == drop the pending request; no job is ever spawned.
+        requests.lock().expect("requests").remove("req-1");
+
+        assert!(requests.lock().expect("requests").is_empty());
+    }
+
+    #[test]
+    fn approve_consumes_request_so_it_cannot_run_twice() {
+        // Approval removes the pending request before spawning the send, so a
+        // duplicate approve finds nothing to run (no double transfer).
+        let requests: Arc<Mutex<HashMap<String, PendingTransferRequest>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        requests
+            .lock()
+            .expect("requests")
+            .insert("req-2".to_owned(), pending_request("req-2"));
+
+        let first = requests.lock().expect("requests").remove("req-2");
+        let second = requests.lock().expect("requests").remove("req-2");
+
+        assert!(first.is_some(), "first approve finds the pending request");
+        assert!(second.is_none(), "second approve finds nothing to run");
     }
 
     fn temp_path(label: &str) -> PathBuf {

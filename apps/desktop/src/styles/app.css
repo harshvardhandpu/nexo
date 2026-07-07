@@ -794,3 +794,61 @@
   text-align: center;
   color: var(--text-faint);
 }
+
+/* ===== AirDrop confirmation modal ========================================= */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(3, 5, 12, 0.6);
+  backdrop-filter: blur(6px);
+  animation: rise var(--dur) var(--ease) both;
+}
+
+.modal {
+  width: min(440px, 92vw);
+  padding: 26px 24px 22px;
+  text-align: center;
+  animation:
+    page-enter var(--dur) var(--ease) both,
+    glow-burst 1.1s var(--ease) both;
+}
+
+.modal__glyph {
+  width: 62px;
+  height: 62px;
+  margin: 0 auto 14px;
+  border-radius: 18px;
+  display: grid;
+  place-items: center;
+  color: var(--cyan);
+  background: var(--accent-grad-soft);
+  border: 1px solid var(--glass-border-strong);
+  animation: node-pulse 3s var(--ease-in-out) infinite;
+}
+
+.modal__title {
+  font-size: 20px;
+}
+.modal__sub {
+  margin: 6px 0 18px;
+  font-size: 13px;
+}
+
+.modal__rows {
+  text-align: left;
+  margin-bottom: 20px;
+  padding: 4px 14px;
+  border-radius: var(--radius);
+  background: rgba(4, 6, 14, 0.5);
+  border: 1px solid var(--glass-border);
+}
+
+.modal__actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
