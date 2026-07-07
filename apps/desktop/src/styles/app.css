@@ -1099,3 +1099,61 @@
   background: rgba(4, 6, 14, 0.5);
   border: 1px solid var(--glass-border);
 }
+
+/* ===== Onboarding: security, identity, self-check ========================= */
+.onboarding__security {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  padding: 14px 16px;
+  border-radius: var(--radius);
+  background: rgba(4, 6, 14, 0.5);
+  border: 1px solid var(--glass-border);
+  text-align: left;
+}
+.onboarding__security-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13.5px;
+  color: var(--text-muted);
+}
+.onboarding__security-item svg {
+  color: var(--cyan);
+}
+.onboarding__identity {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  padding: 14px 16px;
+  border-radius: var(--radius);
+  background: var(--accent-grad-soft);
+  border: 1px solid var(--glass-border-strong);
+  text-align: center;
+}
+.onboarding__identity strong {
+  font-size: 19px;
+}
+.onboarding__check {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.onboarding__check-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: rgba(4, 6, 14, 0.5);
+  border: 1px solid var(--glass-border);
+}
+.onboarding__check-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}

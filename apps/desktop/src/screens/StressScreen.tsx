@@ -1,14 +1,22 @@
 import { useCallback, useState } from "react";
 import {
   CheckCircle2,
+  Clock,
+  Download,
+  FileText,
   FileUp,
+  Gauge,
   Layers,
   Play,
   Trash2,
   XCircle,
   Zap,
 } from "lucide-react";
-import type { StressIteration, StressRun } from "../api/desktop";
+import {
+  type StressIteration,
+  type StressRun,
+  exportStressReport,
+} from "../api/desktop";
 import type { DesktopData } from "../lib/useDesktopData";
 import { useFileDrop } from "../lib/dragdrop";
 import {
@@ -21,7 +29,7 @@ import {
   PanelHead,
   StatusPill,
 } from "../components/ui";
-import { fileName, formatCount } from "../utils";
+import { fileName, formatBytes, formatCount } from "../utils";
 
 function cellColor(state: StressIteration["state"] | "pending"): string {
   switch (state) {
@@ -52,7 +60,13 @@ function IterationGrid({ run }: { run: StressRun }) {
   return <div className="chunk-grid">{cells}</div>;
 }
 
-function RunCard({ run }: { run: StressRun }) {
+function RunCard({
+  run,
+  onExport,
+}: {
+  run: StressRun;
+  onExport: (runId: number) => void;
+}) {
   const attempts = run.completed + run.failed;
   const ratio = run.targetIterations > 0 ? attempts / run.targetIterations : 0;
   const variant =
@@ -92,6 +106,45 @@ function RunCard({ run }: { run: StressRun }) {
         </span>
       </div>
 
+      {/* Task 4: benchmark metrics */}
+      <div className="grid grid--3" style={{ gap: 10 }}>
+        <div className="stat">
+          <span className="stat__label">
+            <Gauge size={12} /> Avg speed
+          </span>
+          <span className="stat__value mono" style={{ fontSize: 18 }}>
+            {run.avgMbps.toFixed(1)} MB/s
+          </span>
+        </div>
+        <div className="stat">
+          <span className="stat__label">
+            <Clock size={12} /> Avg time
+          </span>
+          <span className="stat__value mono" style={{ fontSize: 18 }}>
+            {(run.avgDurationMs / 1000).toFixed(2)} s
+          </span>
+        </div>
+        <div className="stat">
+          <span className="stat__label">
+            <FileText size={12} /> File size
+          </span>
+          <span className="stat__value mono" style={{ fontSize: 18 }}>
+            {formatBytes(run.fileSize)}
+          </span>
+        </div>
+      </div>
+
+      <div className="row row--between">
+        <NeonButton
+          variant="ghost"
+          icon={Download}
+          onClick={() => onExport(run.runId)}
+          disabled={run.state === "running"}
+        >
+          Export JSON report
+        </NeonButton>
+      </div>
+
       {run.lastOutput.length > 0 ? (
         <div className="log">
           {run.lastOutput.slice(-4).map((line, index, all) => (
@@ -114,12 +167,23 @@ export function StressScreen({ data }: { data: DesktopData }) {
   const [host, setHost] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [exported, setExported] = useState<string | null>(null);
 
   const onDrop = useCallback((paths: string[]) => setFilePath(paths[0]), []);
   const dragging = useFileDrop(onDrop);
 
   const runs = [...data.stress].sort((a, b) => b.runId - a.runId);
   const anyFinished = runs.some((run) => run.state !== "running");
+
+  const exportReport = async (runId: number) => {
+    try {
+      const path = await exportStressReport(runId);
+      setError(null);
+      setExported(path);
+    } catch (cause) {
+      setError(String(cause));
+    }
+  };
 
   const submit = async () => {
     setError(null);
@@ -230,8 +294,11 @@ export function StressScreen({ data }: { data: DesktopData }) {
           <Empty icon={Zap}>No stress runs yet.</Empty>
         ) : (
           <div className="stack">
+            {exported ? (
+              <Banner variant="info">Report saved: {exported}</Banner>
+            ) : null}
             {runs.map((run) => (
-              <RunCard key={run.runId} run={run} />
+              <RunCard key={run.runId} run={run} onExport={exportReport} />
             ))}
           </div>
         )}

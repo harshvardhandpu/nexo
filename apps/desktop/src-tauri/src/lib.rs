@@ -309,6 +309,30 @@ pub struct OnboardingResponse {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct BuildInfoResponse {
+    pub version: String,
+    pub build_type: String,
+    pub commit: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityPreviewResponse {
+    pub display_name: String,
+    pub address: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SelfCheckResponse {
+    pub storage_writable: bool,
+    pub receiver_ready: bool,
+    pub discovery_enabled: bool,
+    pub download_dir: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct DiagnosticsResponse {
     pub device_id: String,
     pub certificate_fingerprint: String,
@@ -367,6 +391,34 @@ pub struct StartStressResponse {
     pub run_id: u64,
 }
 
+/// A JSON benchmark sample (one iteration) — Task 4 export shape.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkSample {
+    pub index: u64,
+    pub ok: bool,
+    pub bytes: u64,
+    pub duration_ms: u64,
+    pub mbps: f64,
+}
+
+/// A full benchmark report written to `<state_dir>/reports/`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkReport {
+    pub version: String,
+    pub generated_at: u64,
+    pub file_path: String,
+    pub file_size: u64,
+    pub iterations: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub avg_mbps: f64,
+    pub avg_duration_ms: u64,
+    pub chunk_size: u64,
+    pub samples: Vec<BenchmarkSample>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum StressRunState {
@@ -375,16 +427,22 @@ pub enum StressRunState {
     Failed,
 }
 
-/// One send iteration inside a stress run.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+/// One send iteration inside a stress run, with benchmark metrics.
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct StressIteration {
     pub index: u64,
     pub state: TransferJobState,
     pub error: Option<String>,
+    /// Wall-clock duration of this send iteration.
+    pub duration_ms: u64,
+    /// Bytes transferred (from the core's final progress line).
+    pub bytes: u64,
+    /// Average throughput in MB/s for this iteration.
+    pub mbps: f64,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct StressRunSnapshot {
     pub run_id: u64,
@@ -395,6 +453,12 @@ pub struct StressRunSnapshot {
     pub state: StressRunState,
     pub iterations: Vec<StressIteration>,
     pub last_output: Vec<String>,
+    /// Aggregate benchmark: average MB/s across successful iterations.
+    pub avg_mbps: f64,
+    /// Aggregate benchmark: average successful-iteration duration.
+    pub avg_duration_ms: u64,
+    /// Largest transferred size observed (bytes).
+    pub file_size: u64,
 }
 
 /// Automated repeated-transfer run: sends one file `target_iterations` times via
@@ -427,6 +491,23 @@ impl StressRun {
     }
 
     fn snapshot(&self, run_id: u64) -> StressRunSnapshot {
+        let successful: Vec<&StressIteration> = self
+            .iterations
+            .iter()
+            .filter(|i| i.state == TransferJobState::Completed)
+            .collect();
+        let avg_mbps = if successful.is_empty() {
+            0.0
+        } else {
+            successful.iter().map(|i| i.mbps).sum::<f64>() / successful.len() as f64
+        };
+        let avg_duration_ms = if successful.is_empty() {
+            0
+        } else {
+            successful.iter().map(|i| i.duration_ms).sum::<u64>() / successful.len() as u64
+        };
+        let file_size = self.iterations.iter().map(|i| i.bytes).max().unwrap_or(0);
+
         StressRunSnapshot {
             run_id,
             file_path: self.file_path.clone(),
@@ -436,6 +517,9 @@ impl StressRun {
             state: self.state,
             iterations: self.iterations.clone(),
             last_output: self.last_output.clone(),
+            avg_mbps,
+            avg_duration_ms,
+            file_size,
         }
     }
 }
@@ -1145,6 +1229,59 @@ fn reset_completed_stress_runs(state: State<'_, DesktopAppState>) -> DesktopResu
     Ok(())
 }
 
+/// Task 4: export a benchmark run as a JSON report under `<state_dir>/reports/`.
+/// Returns the written path.
+#[tauri::command]
+fn export_stress_report(run_id: u64, state: State<'_, DesktopAppState>) -> DesktopResult<String> {
+    let snapshot = {
+        let runs = state
+            .stress
+            .lock()
+            .map_err(|_| "desktop stress registry is unavailable".to_owned())?;
+        runs.get(&run_id)
+            .map(|run| run.snapshot(run_id))
+            .ok_or_else(|| format!("unknown stress run: {run_id}"))?
+    };
+    let report = build_benchmark_report(&snapshot, &state.config());
+    let json = serde_json::to_string_pretty(&report)
+        .map_err(|error| format!("failed to serialize report: {error}"))?;
+    let stamp = format!("{}-{}", store::unix_now(), run_id);
+    let path = state
+        .store
+        .write_report(&stamp, &json)
+        .map_err(|error| format!("failed to write report: {error}"))?;
+    Ok(path.display().to_string())
+}
+
+/// Builds the benchmark report body from a stress snapshot (Task 4 metrics:
+/// file size, duration, avg MB/s, checksum-verification is done by the core on
+/// every transfer, so a successful run implies verification passed).
+fn build_benchmark_report(snapshot: &StressRunSnapshot, config: &CliConfig) -> BenchmarkReport {
+    BenchmarkReport {
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        generated_at: store::unix_now(),
+        file_path: snapshot.file_path.clone(),
+        file_size: snapshot.file_size,
+        iterations: snapshot.target_iterations,
+        completed: snapshot.completed,
+        failed: snapshot.failed,
+        avg_mbps: snapshot.avg_mbps,
+        avg_duration_ms: snapshot.avg_duration_ms,
+        chunk_size: config.chunk_size as u64,
+        samples: snapshot
+            .iterations
+            .iter()
+            .map(|iteration| BenchmarkSample {
+                index: iteration.index,
+                ok: iteration.state == TransferJobState::Completed,
+                bytes: iteration.bytes,
+                duration_ms: iteration.duration_ms,
+                mbps: iteration.mbps,
+            })
+            .collect(),
+    }
+}
+
 // ---- Feature 2/3/5: background mode + receiver status ---------------------
 
 #[tauri::command]
@@ -1264,6 +1401,63 @@ fn get_receiver_status(state: State<'_, DesktopAppState>) -> DesktopResult<Recei
         background_enabled: background,
         endpoint,
     })
+}
+
+/// Onboarding identity preview: the name Nexo will use and this device's LAN IP.
+#[tauri::command]
+fn preview_identity(state: State<'_, DesktopAppState>) -> IdentityPreviewResponse {
+    let prefs = state.store.preferences();
+    let display_name = if prefs.device_name.trim().is_empty() {
+        hostname_or_default()
+    } else {
+        prefs.device_name.trim().to_owned()
+    };
+    IdentityPreviewResponse {
+        display_name,
+        address: cli::local_lan_address(),
+    }
+}
+
+/// Onboarding "Test connection" self-check: verifies storage is writable, the
+/// receiver endpoint is reachable-ready, and discovery is enabled. Pure
+/// read/probe — starts no transfer.
+#[tauri::command]
+fn run_self_check(state: State<'_, DesktopAppState>) -> SelfCheckResponse {
+    let config = state.config();
+    let prefs = state.store.preferences();
+
+    // Storage writable: probe the resolved download dir.
+    let download_dir = resolve_download_dir(&prefs.download_dir, &config.receive_dir);
+    let storage_writable = is_writable_dir(&download_dir);
+
+    // Receiver ready: an advertised endpoint exists or background receiving is on
+    // (so it will come up). Either way the receiver stack is usable.
+    let background = state.store.background_settings().background_receiving;
+    let has_endpoint = receiver_endpoint(&config)
+        .map(|endpoint| endpoint.is_some())
+        .unwrap_or(false);
+    let receiver_ready = background || has_endpoint;
+
+    SelfCheckResponse {
+        storage_writable,
+        receiver_ready,
+        discovery_enabled: prefs.discoverable,
+        download_dir: path_to_string(download_dir),
+    }
+}
+
+/// Version + build metadata for Settings → About.
+#[tauri::command]
+fn get_build_info() -> BuildInfoResponse {
+    BuildInfoResponse {
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        build_type: option_env!("NEXO_BUILD_PROFILE")
+            .unwrap_or("unknown")
+            .to_owned(),
+        commit: option_env!("NEXO_GIT_COMMIT")
+            .unwrap_or("unknown")
+            .to_owned(),
+    }
 }
 
 // ---- Task 5: diagnostics --------------------------------------------------
@@ -1497,6 +1691,9 @@ pub fn run() {
             complete_onboarding,
             get_preferences,
             set_preferences,
+            get_build_info,
+            preview_identity,
+            run_self_check,
             get_diagnostics,
             discover_known_peers,
             start_receive,
@@ -1519,6 +1716,7 @@ pub fn run() {
             start_stress_run,
             list_stress_runs,
             reset_completed_stress_runs,
+            export_stress_report,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Nexo desktop");
@@ -1638,15 +1836,27 @@ fn spawn_stress_run<F>(
                     index,
                     state: TransferJobState::Running,
                     error: None,
+                    duration_ms: 0,
+                    bytes: 0,
+                    mbps: 0.0,
                 });
             });
 
+            let started = std::time::Instant::now();
             let mut output = LineBuffer::default();
             let result = work(&mut output);
+            let elapsed_ms = started.elapsed().as_millis() as u64;
             let lines = output.lines();
+            let bytes = last_total_bytes(&lines);
+            let mbps = throughput_mbps(bytes, elapsed_ms);
 
             update_stress(&stress, run_id, |run| {
                 run.last_output = lines;
+                if let Some(entry) = run.iterations.last_mut() {
+                    entry.duration_ms = elapsed_ms;
+                    entry.bytes = bytes;
+                    entry.mbps = mbps;
+                }
                 match result {
                     Ok(()) => {
                         run.completed += 1;
@@ -1675,6 +1885,15 @@ fn spawn_stress_run<F>(
     });
 }
 
+/// Average throughput in MB/s (base-1000 MB, matching how transfer rates are
+/// usually quoted) from a byte count and a millisecond duration.
+fn throughput_mbps(bytes: u64, duration_ms: u64) -> f64 {
+    if duration_ms == 0 {
+        return 0.0;
+    }
+    (bytes as f64 / 1_000_000.0) / (duration_ms as f64 / 1000.0)
+}
+
 fn validate_file_path(path: &Path) -> DesktopResult<()> {
     if !path.is_file() {
         return Err(format!("file does not exist: {}", path.display()));
@@ -1701,6 +1920,17 @@ fn fallback_state_dir() -> PathBuf {
 
 fn path_to_string(path: PathBuf) -> String {
     path.display().to_string()
+}
+
+/// This machine's hostname for the identity preview, or a safe default. Uses the
+/// `HOSTNAME`/`COMPUTERNAME` env vars to avoid adding a dependency.
+fn hostname_or_default() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "This device".to_owned())
 }
 
 fn error_to_string(error: Box<dyn std::error::Error + Send + Sync>) -> String {
@@ -2062,5 +2292,73 @@ mod tests {
 
         std::fs::remove_file(&file).ok();
         std::fs::remove_dir_all(&fallback).ok();
+    }
+
+    #[test]
+    fn throughput_mbps_computes_and_guards_zero_duration() {
+        // 100 MB in 1000 ms = 100 MB/s.
+        assert!((throughput_mbps(100_000_000, 1000) - 100.0).abs() < 1e-9);
+        // Zero duration must not divide by zero.
+        assert_eq!(throughput_mbps(5_000, 0), 0.0);
+    }
+
+    #[test]
+    fn benchmark_report_aggregates_samples_and_writes_json() {
+        let state = state_with_store("bench");
+        // Two successful iterations + one failed.
+        let mut run = StressRun::new("/tmp/big.bin".to_owned(), 3);
+        run.iterations = vec![
+            StressIteration {
+                index: 0,
+                state: TransferJobState::Completed,
+                error: None,
+                duration_ms: 1000,
+                bytes: 100_000_000,
+                mbps: 100.0,
+            },
+            StressIteration {
+                index: 1,
+                state: TransferJobState::Completed,
+                error: None,
+                duration_ms: 2000,
+                bytes: 100_000_000,
+                mbps: 50.0,
+            },
+            StressIteration {
+                index: 2,
+                state: TransferJobState::Failed,
+                error: Some("boom".to_owned()),
+                duration_ms: 10,
+                bytes: 0,
+                mbps: 0.0,
+            },
+        ];
+        run.completed = 2;
+        run.failed = 1;
+
+        let snapshot = run.snapshot(7);
+        assert!(
+            (snapshot.avg_mbps - 75.0).abs() < 1e-9,
+            "avg over successes"
+        );
+        assert_eq!(snapshot.avg_duration_ms, 1500);
+        assert_eq!(snapshot.file_size, 100_000_000);
+
+        let report = build_benchmark_report(&snapshot, &state.config());
+        assert_eq!(report.iterations, 3);
+        assert_eq!(report.completed, 2);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.samples.len(), 3);
+
+        // The report serializes and writes to <state_dir>/reports/.
+        let json = serde_json::to_string_pretty(&report).expect("json");
+        let path = state
+            .store
+            .write_report("test-stamp", &json)
+            .expect("write");
+        assert!(path.ends_with("transfer-report-test-stamp.json"));
+        let round = std::fs::read_to_string(&path).expect("read back");
+        assert!(round.contains("\"avgMbps\""));
+        std::fs::remove_dir_all(state.store.reports_dir()).ok();
     }
 }

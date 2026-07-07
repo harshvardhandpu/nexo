@@ -1,81 +1,150 @@
+<div align="center">
+
 # Nexo
 
-High-performance decentralized file transfer and synchronization.
+### Fast, encrypted, peer-to-peer file transfer
 
-Nexo is a peer-to-peer data transfer platform designed to move data efficiently, reliably, and securely without relying on centralized cloud storage.
+Move large files directly between your devices over the local network —
+**end-to-end encrypted**, **resumable**, and **cloud-free**. Like AirDrop, but
+cross-platform and open.
 
-## Vision
+</div>
 
-Move data, not files.
+---
 
-Most file-sharing applications repeatedly transfer identical data and waste bandwidth. Nexo aims to minimize transferred data through intelligent chunking, deduplication, delta synchronization, and adaptive networking.
+## Why Nexo
 
-## Goals
+Most "quick share" tools bounce your files through a cloud server, cap your file
+size, or fall over on a flaky connection. Nexo connects your devices **directly**
+over an encrypted [QUIC](https://www.chromium.org/quic/) channel, verifies every
+byte with SHA-256, and **resumes exactly where it left off** if the link drops —
+so a 5 GB transfer survives a closed laptop lid.
 
-* High-speed peer-to-peer transfers
-* End-to-end encryption
-* Zero mandatory cloud infrastructure
-* Resume interrupted transfers
-* Minimize bandwidth usage
-* Cross-platform support
-* Open architecture
+## Features
 
-## Planned Features
+- ✅ **QUIC transport** — modern, multiplexed, encrypted-by-default UDP transport
+- ✅ **Resume** — crash-safe, incremental checkpoints; interrupted transfers pick up mid-file
+- ✅ **End-to-end encryption** — per-session keys; the transport is TLS 1.3 (QUIC)
+- ✅ **No cloud** — files go device→device; nothing is uploaded to a server
+- ✅ **LAN discovery** — devices find each other automatically over mDNS
+- ✅ **Explicit consent** — both sender and receiver approve every transfer; trusted-device auto-accept is opt-in
+- ✅ **Integrity verified** — per-chunk + whole-file SHA-256; zero silent corruption
+- ✅ **Desktop app** — premium dark UI, system tray, background receiver, notifications, onboarding
+- ✅ **Cross-platform** — Linux (AppImage/deb) and Windows (MSI)
 
-### Core Transfer Engine
+## How it works
 
-* Chunked transfers
-* Parallel streams
-* Resume support
-* Integrity verification
-* End-to-end encryption
+```
+   Device A                          Device B
+ ┌──────────┐   mDNS discovery     ┌──────────┐
+ │  Nexo    │◀────────────────────▶│  Nexo    │
+ │          │                      │          │
+ │  send ──▶│  1. sender approves  │          │
+ │          │  2. receiver approves│◀─ accept │
+ │          │═════ QUIC (TLS 1.3) ═│          │
+ │          │  chunked + SHA-256   │          │
+ │          │  resumable transfer  │─▶ file   │
+ └──────────┘                      └──────────┘
+        no cloud · no account · encrypted end to end
+```
 
-### Smart Transfer Engine
+1. **Discover** — devices advertise over mDNS on the local network.
+2. **Request** — the sender picks a device and confirms.
+3. **Approve** — the receiver accepts (or auto-accepts a trusted device).
+4. **Transfer** — the file is chunked, encrypted, streamed over QUIC, and
+   verified. If interrupted, it resumes from the last checkpoint.
 
-* Dynamic chunk sizing
-* Adaptive compression
-* Network-aware optimization
-* Intelligent scheduling
+## Screenshots
 
-### Delta Engine
+> _Desktop app — Midnight Flow theme (dark, glass, cyan→purple)._
+>
+> Dashboard · Devices · Send (drag & drop) · Transfer monitor · Trusted devices ·
+> History · Settings · Onboarding.
+>
+> _(Add PNGs under `docs/screenshots/` and link them here when capturing on a
+> machine with a display.)_
 
-* Content-defined chunking
-* Deduplication
-* Delta transfers
+## Install
 
-### Reliability
+**Linux** — download the AppImage or `.deb` from the
+[latest release](https://github.com/harshvardhandpu/nexo/releases):
 
-* Crash recovery
-* Network switching
-* Forward error correction
+```bash
+# AppImage (any distro)
+chmod +x Nexo-linux.AppImage && ./Nexo-linux.AppImage
 
-### Advanced Networking
+# Debian / Ubuntu
+sudo apt install ./Nexo-linux.deb
+```
 
-* Relay nodes
-* Multipath transfers
-* Mesh-assisted distribution
+Full instructions (dependencies, tray setup, autostart, troubleshooting):
+[`docs/linux-install.md`](docs/linux-install.md).
 
-## Benchmark Targets
+**Windows** — run the `Nexo-windows.msi` installer.
 
-### Local Network
+## Command line
 
-* 1 Gbps LAN → 900+ Mbps effective throughput
-* 10 Gbps LAN → 8+ Gbps effective throughput
+Nexo also ships a CLI (used by the desktop app under the hood):
 
-### Internet
+```bash
+nexo --version
+nexo receive               # advertise + receive (asks to accept each transfer)
+nexo discover              # list nearby devices
+nexo send FILE --host ADDR # send to a discovered device
+```
 
-* Automatic resume after disconnect
-* Recovery in under 5 seconds
-* Persistent transfer state
+## Build from source
 
-### Reliability
+Prerequisites: Rust (stable), Node ≥ 18, and the Linux system libraries in
+[`docs/linux-install.md`](docs/linux-install.md).
 
-* End-to-end integrity verification
-* Automatic recovery mechanisms
-* Zero silent corruption
+```bash
+git clone https://github.com/harshvardhandpu/nexo
+cd nexo
 
-## Project Status
+# Rust workspace (core engine + CLI)
+cargo test --workspace
+cargo run -p cli -- --help
 
-Pre-alpha
+# Desktop app
+cd apps/desktop
+npm ci
+npm run tauri dev          # develop
+npm run tauri build        # package AppImage + deb
+```
 
-Project planning and architecture phase.
+## Architecture
+
+Nexo is a Rust workspace with a thin Tauri + React desktop layer on top:
+
+| Crate / dir | Responsibility |
+|---|---|
+| `crates/networking` | QUIC transport + mDNS discovery |
+| `crates/engine` | chunking, transfer pipeline, SHA-256 verification |
+| `crates/storage` | SQLite checkpoint / resume / session persistence |
+| `crates/crypto` | session key exchange + AEAD |
+| `crates/common` | shared types + transfer protocol messages |
+| `crates/cli` | orchestration + command-line app |
+| `apps/desktop` | Tauri (Rust bridge) + React UI |
+
+The transfer engine is stable and frozen; the desktop app only calls its public
+APIs. See [`docs/`](docs/) for the protocol, transport, session, update system,
+and release process.
+
+## Security
+
+- Transport is QUIC (TLS 1.3); payloads are additionally encrypted with
+  per-session keys.
+- Every transfer requires explicit sender **and** receiver approval. Auto-accept
+  is limited to devices you have explicitly trusted and is off by default.
+- Certificate trust is never bypassed by any UI setting.
+
+## Status
+
+**1.0 Release Candidate.** Core transfer engine complete; desktop app feature
+complete (tray, background receiver, notifications, onboarding, autostart,
+diagnostics). See [`docs/release-checklist.md`](docs/release-checklist.md).
+
+## License
+
+See repository.

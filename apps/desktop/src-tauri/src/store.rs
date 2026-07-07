@@ -319,6 +319,26 @@ impl AppStore {
         let _lock = self.guard.lock();
         write_json(&self.state_dir, &self.preferences_path(), &preferences);
     }
+
+    // ---- Benchmark reports ------------------------------------------------
+
+    /// Directory where benchmark JSON reports are written
+    /// (`<state_dir>/reports/`).
+    pub fn reports_dir(&self) -> PathBuf {
+        self.state_dir.join("reports")
+    }
+
+    /// Writes a benchmark report as pretty JSON and returns the file path.
+    /// `stamp` is a caller-supplied filename-safe timestamp (the store never
+    /// reads the clock beyond `unix_now`).
+    pub fn write_report(&self, stamp: &str, json: &str) -> std::io::Result<PathBuf> {
+        let _lock = self.guard.lock();
+        let dir = self.reports_dir();
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("transfer-report-{stamp}.json"));
+        std::fs::write(&path, json)?;
+        Ok(path)
+    }
 }
 
 fn read_json_or<T: for<'de> Deserialize<'de>>(path: &Path, fallback: T) -> T {

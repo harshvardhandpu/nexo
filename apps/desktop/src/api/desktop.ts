@@ -93,6 +93,36 @@ export function getDiagnostics() {
   return invoke<Diagnostics>("get_diagnostics");
 }
 
+export type BuildInfo = {
+  version: string;
+  buildType: string;
+  commit: string;
+};
+
+export function getBuildInfo() {
+  return invoke<BuildInfo>("get_build_info");
+}
+
+export type IdentityPreview = {
+  displayName: string;
+  address: string | null;
+};
+
+export type SelfCheck = {
+  storageWritable: boolean;
+  receiverReady: boolean;
+  discoveryEnabled: boolean;
+  downloadDir: string;
+};
+
+export function previewIdentity() {
+  return invoke<IdentityPreview>("preview_identity");
+}
+
+export function runSelfCheck() {
+  return invoke<SelfCheck>("run_self_check");
+}
+
 export type DesktopSettings = {
   stateDir: string;
   receiveDir: string;
@@ -155,6 +185,9 @@ export type StressIteration = {
   index: number;
   state: TransferJobState;
   error: string | null;
+  durationMs: number;
+  bytes: number;
+  mbps: number;
 };
 
 export type StressRun = {
@@ -166,6 +199,9 @@ export type StressRun = {
   state: StressRunState;
   iterations: StressIteration[];
   lastOutput: string[];
+  avgMbps: number;
+  avgDurationMs: number;
+  fileSize: number;
 };
 
 export type StartStressResponse = {
@@ -359,4 +395,8 @@ export function listStressRuns() {
 
 export function resetCompletedStressRuns() {
   return invoke<void>("reset_completed_stress_runs");
+}
+
+export function exportStressReport(runId: number) {
+  return invoke<string>("export_stress_report", { runId });
 }

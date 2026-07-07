@@ -15,7 +15,9 @@ import type { DesktopData } from "../lib/useDesktopData";
 import {
   type AppPreferences,
   type BackgroundSettings,
+  type BuildInfo,
   getBackgroundSettings,
+  getBuildInfo,
   getPreferences,
   setBackgroundSettings,
   setPreferences,
@@ -42,10 +44,12 @@ export function SettingsScreen({ data }: { data: DesktopData }) {
   const { settings, paths } = data;
   const [prefs, setPrefs] = useState<AppPreferences | null>(null);
   const [bg, setBg] = useState<BackgroundSettings | null>(null);
+  const [build, setBuild] = useState<BuildInfo | null>(null);
 
   useEffect(() => {
     void getPreferences().then(setPrefs).catch(() => {});
     void getBackgroundSettings().then(setBg).catch(() => {});
+    void getBuildInfo().then(setBuild).catch(() => {});
   }, []);
 
   const savePrefs = async (next: AppPreferences) => {
@@ -216,6 +220,11 @@ export function SettingsScreen({ data }: { data: DesktopData }) {
           transport, SHA-256 chunk + whole-file verification, and crash-safe
           incremental resume. The desktop layer only calls the unchanged core.
         </p>
+        <div style={{ marginTop: 12 }}>
+          <Row k="Version" v={build ? `Nexo ${build.version}` : "—"} />
+          <Row k="Build type" v={build?.buildType ?? "—"} />
+          <Row k="Commit" v={build?.commit ?? "—"} />
+        </div>
         <div className="row row--wrap" style={{ marginTop: 14, gap: 10 }}>
           <span className="pill">
             <Radio size={13} /> Local-first

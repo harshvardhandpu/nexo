@@ -42,9 +42,15 @@ const DISCOVERY_DURATION: Duration = Duration::from_secs(3);
 #[derive(Debug, Parser)]
 #[command(name = "nexo")]
 #[command(about = "Nexo command-line file transfer")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 pub struct CliArgs {
     #[command(subcommand)]
     command: CliCommand,
+}
+
+/// The Nexo version string (from the crate's Cargo package version).
+pub const fn version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
 }
 
 #[derive(Debug, Subcommand)]
@@ -948,6 +954,15 @@ fn receiver_advertised_addr_with_lan(
 ) -> SocketAddr {
     let address = lan_address.unwrap_or(Ipv4Addr::LOCALHOST);
     SocketAddr::new(IpAddr::V4(address), bound_addr.port())
+}
+
+/// This device's preferred LAN IPv4 address for peer discovery, if one exists.
+/// Read-only helper for the desktop's identity preview; no engine interaction.
+pub fn local_lan_address() -> Option<String> {
+    preferred_lan_ipv4()
+        .ok()
+        .flatten()
+        .map(|address| address.to_string())
 }
 
 fn preferred_lan_ipv4() -> CliResult<Option<Ipv4Addr>> {
@@ -2424,6 +2439,118 @@ mod tests {
         }
 
         Ok(sent)
+    }
+
+    /// Task 5: crash-recovery reliability harness. Runs the full
+    /// interrupt -> restart -> resume -> verify cycle `cycles` times and returns
+    /// (successes, total_recovery_time). A cycle "succeeds" when the resumed
+    /// transfer reproduces the source file byte-for-byte (the receiver's
+    /// verify_complete SHA-256 gate must pass for the file to be written).
+    ///
+    /// This drives the real QUIC + resume + checkpoint stack; nothing in the
+    /// engine is modified. Kept small by default so it is fast and not flaky; a
+    /// heavier variant is available via the ignored large-file test.
+    fn run_recovery_cycles(cycles: usize, chunk_size: usize, bytes: usize) -> (usize, Duration) {
+        let mut successes = 0;
+        let mut total_recovery = Duration::ZERO;
+
+        for cycle in 0..cycles {
+            let workspace = TempWorkspace::new(&format!("recovery-{cycle}"));
+            let source = workspace.path("payload.bin");
+            let receive_dir = workspace.path("received");
+            let state_dir = workspace.path("state");
+            let contents: Vec<u8> = (0..bytes).map(|index| (index % 251) as u8).collect();
+            fs::create_dir_all(&receive_dir).expect("receive dir");
+            fs::write(&source, &contents).expect("source");
+            let config = CliConfig {
+                state_dir,
+                receive_dir: receive_dir.clone(),
+                chunk_size,
+            };
+            let total_chunks = generate_manifest(&source, config.chunk_size)
+                .expect("manifest")
+                .total_chunks as usize;
+
+            // Run 1: receiver accepts, sender sends part of the file, then drops.
+            let receive_config = config.clone();
+            let receiver = thread::spawn(move || {
+                let mut output = Vec::new();
+                run_receive(&receive_config, &mut output)
+            });
+            wait_for_receiver_advert(&config);
+            let advert = load_receiver_advert(&config).expect("advert");
+            let partial = (total_chunks / 2).max(1);
+            let sent = send_partial_then_drop(&source, advert.address, &config, partial)
+                .expect("partial send");
+            assert!(
+                sent >= 1 && sent < total_chunks,
+                "expected a partial interrupt"
+            );
+            let _ = receiver.join().expect("receiver thread"); // errors on interrupt
+
+            // Run 2: restart receiver + sender, time the resume to completion.
+            let recovery_start = Instant::now();
+            let receive_config = config.clone();
+            let receiver = thread::spawn(move || {
+                let mut output = Vec::new();
+                run_receive(&receive_config, &mut output)
+            });
+            wait_for_receiver_advert(&config);
+            let mut send_output = Vec::new();
+            let resumed = run_send_gated(
+                &source,
+                Some(advert.address),
+                true,
+                &config,
+                &mut send_output,
+            );
+            let received = receiver.join().expect("receiver thread");
+            let recovery = recovery_start.elapsed();
+
+            // A cycle succeeds only if both sides finished and bytes match.
+            let ok = resumed.is_ok()
+                && received.is_ok()
+                && fs::read(receive_dir.join("payload.bin")).ok().as_deref() == Some(&contents[..]);
+            if ok {
+                successes += 1;
+                total_recovery += recovery;
+            }
+        }
+
+        (successes, total_recovery)
+    }
+
+    #[test]
+    fn crash_recovery_is_reliable_across_repeated_cycles() {
+        // Repeated interrupt/resume/verify must succeed every time. Small file +
+        // a few cycles keeps this fast and deterministic; the mechanism is
+        // identical to a 5 GB run (only chunk count differs).
+        let cycles = 3;
+        let (successes, total_recovery) = run_recovery_cycles(cycles, 8, 96);
+        assert_eq!(successes, cycles, "every recovery cycle must succeed");
+        let avg = total_recovery / cycles as u32;
+        // Sanity: recovery completes quickly for a tiny file.
+        assert!(
+            avg < Duration::from_secs(30),
+            "average recovery {avg:?} unexpectedly slow"
+        );
+    }
+
+    #[test]
+    #[ignore = "heavy: 10 recovery cycles over a larger file; run with --ignored"]
+    fn crash_recovery_reliability_report_10x() {
+        // Task 5's headline scenario: 10 interrupt/resume/verify cycles with a
+        // reliability report. Uses a larger (still bounded) file so it exercises
+        // many chunks per cycle without needing a literal 5 GB payload.
+        let cycles = 10;
+        let (successes, total_recovery) = run_recovery_cycles(cycles, 4 * 1024, 4 * 1024 * 1024);
+        let avg = if successes > 0 {
+            total_recovery / successes as u32
+        } else {
+            Duration::ZERO
+        };
+        println!("crash-recovery report: {successes}/{cycles} succeeded, avg recovery {avg:?}");
+        assert_eq!(successes, cycles, "all 10 recovery cycles must succeed");
     }
 
     fn wait_for_receiver_advert(config: &CliConfig) {

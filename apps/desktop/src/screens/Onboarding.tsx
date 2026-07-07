@@ -1,15 +1,40 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   ArrowRight,
   Check,
+  CloudOff,
+  HardDriveDownload,
+  Lock,
   Radio,
   ShieldCheck,
   Sparkles,
   Wifi,
+  Zap,
 } from "lucide-react";
-import { completeOnboarding } from "../api/desktop";
+import {
+  type IdentityPreview,
+  type SelfCheck,
+  completeOnboarding,
+  previewIdentity,
+  runSelfCheck,
+} from "../api/desktop";
 import { NeonButton, Toggle } from "../components/ui";
 import { NodeNetwork } from "../components/NodeNetwork";
+
+function CheckRow({ ok, label }: { ok: boolean; label: string }) {
+  return (
+    <div className="onboarding__check-row">
+      <span
+        className={`presence-dot ${ok ? "presence-dot--online" : ""}`}
+        style={{ position: "relative", inset: 0, width: 10, height: 10 }}
+      />
+      <span className={ok ? "" : "text-faint"}>{label}</span>
+      <span className={ok ? "" : "text-faint"} style={{ marginLeft: "auto" }}>
+        {ok ? "OK" : "—"}
+      </span>
+    </div>
+  );
+}
 
 /**
  * Feature 3: first-launch onboarding. Three steps — welcome, device setup,
@@ -23,6 +48,26 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
   const [background, setBackground] = useState(true);
   const [startOnLogin, setStartOnLogin] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [identity, setIdentity] = useState<IdentityPreview | null>(null);
+  const [check, setCheck] = useState<SelfCheck | null>(null);
+  const [checking, setChecking] = useState(false);
+
+  useEffect(() => {
+    void previewIdentity().then(setIdentity).catch(() => {});
+  }, []);
+
+  const previewName = deviceName.trim() || identity?.displayName || "This device";
+
+  const testConnection = async () => {
+    setChecking(true);
+    try {
+      setCheck(await runSelfCheck());
+    } catch {
+      setCheck(null);
+    } finally {
+      setChecking(false);
+    }
+  };
 
   const finish = async () => {
     setBusy(true);
@@ -68,6 +113,17 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
               Encrypted peer-to-peer file transfers. No cloud, no accounts — your
               files go directly device to device, secured end to end.
             </p>
+            <div className="onboarding__security">
+              <div className="onboarding__security-item">
+                <Lock size={16} /> End-to-end encrypted
+              </div>
+              <div className="onboarding__security-item">
+                <CloudOff size={16} /> No cloud server
+              </div>
+              <div className="onboarding__security-item">
+                <HardDriveDownload size={16} /> Files stay on your devices
+              </div>
+            </div>
             <NeonButton icon={ArrowRight} onClick={() => setStep(1)}>
               Get started
             </NeonButton>
@@ -93,6 +149,15 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                 autoFocus
               />
             </label>
+
+            <div className="onboarding__identity">
+              <span className="text-faint">Nexo will identify this device as</span>
+              <strong className="gradient-text">{previewName}</strong>
+              <span className="mono text-muted">
+                {identity?.address ?? "no LAN address detected"}
+              </span>
+            </div>
+
             <div className="onboarding__toggles">
               <Toggle
                 label="Discoverable"
@@ -115,6 +180,29 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                 onChange={setStartOnLogin}
               />
             </div>
+
+            <div className="onboarding__check">
+              <NeonButton
+                variant="ghost"
+                icon={Zap}
+                onClick={testConnection}
+                loading={checking}
+                block
+              >
+                Test connection
+              </NeonButton>
+              {check ? (
+                <div className="onboarding__check-rows">
+                  <CheckRow ok={check.storageWritable} label="Storage writable" />
+                  <CheckRow ok={check.receiverReady} label="Receiver available" />
+                  <CheckRow
+                    ok={check.discoveryEnabled}
+                    label="Discovery enabled"
+                  />
+                </div>
+              ) : null}
+            </div>
+
             <div className="row" style={{ gap: 10, width: "100%" }}>
               <NeonButton variant="ghost" onClick={() => setStep(0)}>
                 Back
