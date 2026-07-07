@@ -19,6 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const TRUSTED_FILE: &str = "trusted-devices.json";
 const HISTORY_FILE: &str = "transfer-history.json";
+const SETTINGS_FILE: &str = "background-settings.json";
 const HISTORY_CAP: usize = 500;
 
 /// Seconds since the Unix epoch (0 if the clock is before the epoch).
@@ -27,6 +28,27 @@ pub fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0)
+}
+
+/// Persisted background-mode preferences (Feature 2 / 5). Defaults make Nexo
+/// behave like AirDrop: available in the background unless the user opts out.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundSettings {
+    /// Keep the receiver + advertisement alive when the window is closed.
+    pub background_receiving: bool,
+    /// Launch Nexo on system startup (honored by the OS-level autostart layer;
+    /// stored here so the UI reflects it).
+    pub start_on_login: bool,
+}
+
+impl Default for BackgroundSettings {
+    fn default() -> Self {
+        Self {
+            background_receiving: true,
+            start_on_login: false,
+        }
+    }
 }
 
 /// A device the user has explicitly trusted, with UI metadata layered over the
@@ -207,6 +229,29 @@ impl AppStore {
             &HistoryFile::default(),
         );
     }
+
+    // ---- Background settings ----------------------------------------------
+
+    fn settings_path(&self) -> PathBuf {
+        self.state_dir.join(SETTINGS_FILE)
+    }
+
+    pub fn background_settings(&self) -> BackgroundSettings {
+        let _lock = self.guard.lock();
+        read_json_or(&self.settings_path(), BackgroundSettings::default())
+    }
+
+    pub fn set_background_settings(&self, settings: BackgroundSettings) {
+        let _lock = self.guard.lock();
+        write_json(&self.state_dir, &self.settings_path(), &settings);
+    }
+}
+
+fn read_json_or<T: for<'de> Deserialize<'de>>(path: &Path, fallback: T) -> T {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(fallback),
+        Err(_) => fallback,
+    }
 }
 
 fn read_json<T: Default + for<'de> Deserialize<'de>>(path: &Path) -> T {
@@ -333,5 +378,22 @@ mod tests {
         std::fs::create_dir_all(&store.state_dir).expect("dir");
         std::fs::write(store.trusted_path(), b"{ not json").expect("write");
         assert!(store.trusted_devices().is_empty());
+    }
+
+    #[test]
+    fn background_settings_default_on_and_roundtrip() {
+        let store = temp_store("bg-settings");
+        // Feature 2: default is background receiving ON (AirDrop-like).
+        let defaults = store.background_settings();
+        assert!(defaults.background_receiving);
+        assert!(!defaults.start_on_login);
+
+        store.set_background_settings(BackgroundSettings {
+            background_receiving: false,
+            start_on_login: true,
+        });
+        let loaded = store.background_settings();
+        assert!(!loaded.background_receiving);
+        assert!(loaded.start_on_login);
     }
 }

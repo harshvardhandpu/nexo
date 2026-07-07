@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import {
   ArrowDownToLine,
   Boxes,
@@ -8,6 +9,10 @@ import {
 } from "lucide-react";
 import type { DesktopData } from "../lib/useDesktopData";
 import type { Screen } from "./nav";
+import {
+  type ReceiverStatus,
+  getReceiverStatus,
+} from "../api/desktop";
 import { JobCard } from "../components/JobCard";
 import { NodeNetwork } from "../components/NodeNetwork";
 import {
@@ -20,6 +25,50 @@ import {
   StatusPill,
 } from "../components/ui";
 import { formatBytes, formatCount, formatPercent } from "../utils";
+
+function ReceiverStatusPanel() {
+  const [status, setStatus] = useState<ReceiverStatus | null>(null);
+
+  useEffect(() => {
+    const load = () => void getReceiverStatus().then(setStatus).catch(() => {});
+    load();
+    const timer = window.setInterval(load, 2000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const available = status?.receiving && status?.discoverable;
+
+  return (
+    <GlassPanel>
+      <div className="row row--between row--wrap">
+        <div className="row" style={{ gap: 12 }}>
+          <span
+            className={`presence-dot ${available ? "presence-dot--online" : ""}`}
+            style={{ position: "relative", inset: 0, width: 14, height: 14 }}
+          />
+          <div>
+            <strong style={{ fontSize: 15 }}>
+              Receiver status ·{" "}
+              <span className={available ? "gradient-text" : "text-muted"}>
+                {available ? "Available" : status?.receiving ? "Starting…" : "Offline"}
+              </span>
+            </strong>
+            <div className="text-faint" style={{ fontSize: 12.5 }}>
+              {available
+                ? "Device discoverable — nearby peers can send to you"
+                : status?.backgroundEnabled
+                  ? "Background mode on — starting receiver…"
+                  : "Background mode off — open Receive to accept transfers"}
+            </div>
+          </div>
+        </div>
+        <StatusPill variant={available ? "live" : "idle"}>
+          <Radio size={13} /> {status?.endpoint ?? "not advertised"}
+        </StatusPill>
+      </div>
+    </GlassPanel>
+  );
+}
 
 export function Dashboard({
   data,
@@ -40,6 +89,7 @@ export function Dashboard({
 
   return (
     <div className="page" key="dashboard">
+      <ReceiverStatusPanel />
       <div className="hero">
         <GlassPanel strong className="hero__panel">
           <StatusPill variant={receiverReady ? "ok" : "idle"}>

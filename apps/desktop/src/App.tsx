@@ -7,6 +7,7 @@ import { ConfirmDialog } from "./components/ConfirmDialog";
 import { IncomingTransferDialog } from "./components/IncomingTransferDialog";
 import { Banner, StatusPill } from "./components/ui";
 import { useDesktopData } from "./lib/useDesktopData";
+import { notifyIncoming } from "./lib/notify";
 import {
   INCOMING_TRANSFER_EVENT,
   TRANSFER_REQUEST_EVENT,
@@ -48,12 +49,26 @@ export default function App() {
   }, []);
 
   // Receiver-side: the backend emits `incoming_transfer_request` while a receive
-  // is parked on the approval gate. Show the accept/reject modal.
+  // is parked on the approval gate. Show the accept/reject modal, and — if the
+  // window is hidden (background mode) — an OS notification too.
   useEffect(() => {
     const unlisten = listen<IncomingTransfer>(
       INCOMING_TRANSFER_EVENT,
-      (event) => setIncoming(event.payload),
+      (event) => {
+        setIncoming(event.payload);
+        void notifyIncoming(event.payload);
+      },
     );
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  // Tray "Settings"/"Open" emit a `navigate` event to focus a screen.
+  useEffect(() => {
+    const unlisten = listen<string>("navigate", (event) => {
+      setScreen(event.payload as Screen);
+    });
     return () => {
       void unlisten.then((fn) => fn());
     };

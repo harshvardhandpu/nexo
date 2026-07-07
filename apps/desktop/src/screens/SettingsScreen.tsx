@@ -1,6 +1,19 @@
-import { Cpu, Database, FolderOpen, HardDrive, ShieldCheck } from "lucide-react";
+import { useEffect, useState } from "react";
+import {
+  Cpu,
+  Database,
+  FolderOpen,
+  HardDrive,
+  Radio,
+  ShieldCheck,
+} from "lucide-react";
 import type { DesktopData } from "../lib/useDesktopData";
-import { GlassPanel, PanelHead } from "../components/ui";
+import {
+  type BackgroundSettings,
+  getBackgroundSettings,
+  setBackgroundSettings,
+} from "../api/desktop";
+import { GlassPanel, PanelHead, Toggle } from "../components/ui";
 import { formatBytes } from "../utils";
 
 function Row({ k, v }: { k: string; v: string }) {
@@ -12,11 +25,66 @@ function Row({ k, v }: { k: string; v: string }) {
   );
 }
 
+function BackgroundModePanel() {
+  const [settings, setSettings] = useState<BackgroundSettings | null>(null);
+
+  useEffect(() => {
+    void getBackgroundSettings().then(setSettings).catch(() => {});
+  }, []);
+
+  const update = async (next: BackgroundSettings) => {
+    setSettings(next);
+    try {
+      setSettings(
+        await setBackgroundSettings(
+          next.backgroundReceiving,
+          next.startOnLogin,
+        ),
+      );
+    } catch {
+      void getBackgroundSettings().then(setSettings).catch(() => {});
+    }
+  };
+
+  return (
+    <GlassPanel>
+      <PanelHead icon={Radio} title="Background mode" />
+      <div className="stack">
+        <Toggle
+          label="Keep Nexo available when closed"
+          hint="Stay discoverable and accept incoming transfers after the window is closed."
+          checked={settings?.backgroundReceiving ?? true}
+          onChange={(value) =>
+            update({
+              backgroundReceiving: value,
+              startOnLogin: settings?.startOnLogin ?? false,
+            })
+          }
+        />
+        <div className="divider" />
+        <Toggle
+          label="Start Nexo on system startup"
+          hint="Launch automatically after you log in."
+          checked={settings?.startOnLogin ?? false}
+          onChange={(value) =>
+            update({
+              backgroundReceiving: settings?.backgroundReceiving ?? true,
+              startOnLogin: value,
+            })
+          }
+        />
+      </div>
+    </GlassPanel>
+  );
+}
+
 export function SettingsScreen({ data }: { data: DesktopData }) {
   const { settings, paths } = data;
 
   return (
     <div className="page" key="settings">
+      <BackgroundModePanel />
+
       <div className="grid grid--2">
         <GlassPanel>
           <PanelHead icon={HardDrive} title="Storage" />

@@ -271,6 +271,31 @@ pub struct StartJobResponse {
     pub job_id: u64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundSettingsResponse {
+    pub background_receiving: bool,
+    pub start_on_login: bool,
+}
+
+impl From<store::BackgroundSettings> for BackgroundSettingsResponse {
+    fn from(settings: store::BackgroundSettings) -> Self {
+        Self {
+            background_receiving: settings.background_receiving,
+            start_on_login: settings.start_on_login,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiverStatusResponse {
+    pub receiving: bool,
+    pub discoverable: bool,
+    pub background_enabled: bool,
+    pub endpoint: Option<String>,
+}
+
 /// UI-facing view of a pending AirDrop transfer request (the modal payload).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -543,6 +568,25 @@ fn start_receive(
     app: tauri::AppHandle,
     state: State<'_, DesktopAppState>,
 ) -> DesktopResult<StartJobResponse> {
+    let job_id = spawn_receive_job(&app, &state)?;
+    Ok(StartJobResponse { job_id })
+}
+
+/// Spawns one gated receive session and returns its job id. Shared by the
+/// `start_receive` command and the background auto-start, so the approval gate,
+/// history recording, and event flow are identical whether the user pressed
+/// "Receive" or the app started receiving on its own.
+fn spawn_receive_job(app: &tauri::AppHandle, state: &DesktopAppState) -> DesktopResult<u64> {
+    // Only one active receiver at a time: if a receive job is already running,
+    // reuse it rather than binding a second listener.
+    if let Ok(jobs) = state.jobs.lock()
+        && let Some((existing, _)) = jobs.iter().find(|(_, job)| {
+            job.kind == TransferJobKind::Receive && job.state == TransferJobState::Running
+        })
+    {
+        return Ok(*existing);
+    }
+
     let config = state.config();
     let job_id = state.next_job_id();
     insert_job(
@@ -556,6 +600,7 @@ fn start_receive(
     // blocks until the UI answers via approve_/reject_incoming_request. The QUIC
     // keep-alive holds the connection open while it waits. Never auto-accepts.
     let incoming = state.incoming.clone();
+    let app = app.clone();
     let approver = move |request: &IncomingTransferRequest| -> bool {
         let response = IncomingTransferResponse::from(request);
         let (decision_tx, decision_rx) = std::sync::mpsc::sync_channel::<bool>(1);
@@ -595,7 +640,7 @@ fn start_receive(
         move |output| run_receive_gated(&config, output, approver),
     );
 
-    Ok(StartJobResponse { job_id })
+    Ok(job_id)
 }
 
 #[tauri::command]
@@ -1003,6 +1048,60 @@ fn reset_completed_stress_runs(state: State<'_, DesktopAppState>) -> DesktopResu
     Ok(())
 }
 
+// ---- Feature 2/3/5: background mode + receiver status ---------------------
+
+#[tauri::command]
+fn get_background_settings(state: State<'_, DesktopAppState>) -> BackgroundSettingsResponse {
+    state.store.background_settings().into()
+}
+
+/// Persists background settings. When background receiving is turned on and no
+/// receiver is running yet, starts one immediately so the toggle takes effect
+/// without reopening the app.
+#[tauri::command]
+fn set_background_settings(
+    background_receiving: bool,
+    start_on_login: bool,
+    app: tauri::AppHandle,
+    state: State<'_, DesktopAppState>,
+) -> DesktopResult<BackgroundSettingsResponse> {
+    let settings = store::BackgroundSettings {
+        background_receiving,
+        start_on_login,
+    };
+    state.store.set_background_settings(settings);
+    if background_receiving {
+        let _ = spawn_receive_job(&app, &state);
+    }
+    Ok(settings.into())
+}
+
+/// Receiver status for the Dashboard (Feature 5): whether a receive session is
+/// active, whether the device is discoverable, and the advertised endpoint.
+#[tauri::command]
+fn get_receiver_status(state: State<'_, DesktopAppState>) -> DesktopResult<ReceiverStatusResponse> {
+    let receiving = state
+        .jobs
+        .lock()
+        .map(|jobs| {
+            jobs.values().any(|job| {
+                job.kind == TransferJobKind::Receive && job.state == TransferJobState::Running
+            })
+        })
+        .unwrap_or(false);
+    let endpoint = receiver_endpoint(&state.config())
+        .map_err(error_to_string)?
+        .map(|endpoint| endpoint.address);
+    let background = state.store.background_settings().background_receiving;
+
+    Ok(ReceiverStatusResponse {
+        receiving,
+        discoverable: receiving && endpoint.is_some(),
+        background_enabled: background,
+        endpoint,
+    })
+}
+
 pub fn build_config(app_handle: &tauri::AppHandle) -> CliConfig {
     let app_data_dir = app_handle
         .path()
@@ -1015,18 +1114,145 @@ pub fn build_config(app_handle: &tauri::AppHandle) -> CliConfig {
     }
 }
 
+/// Menu item ids for the tray.
+const TRAY_OPEN: &str = "tray_open";
+const TRAY_TOGGLE_RECEIVE: &str = "tray_toggle_receive";
+const TRAY_SETTINGS: &str = "tray_settings";
+const TRAY_QUIT: &str = "tray_quit";
+
+/// Builds (or rebuilds) the tray menu to reflect the current background state.
+fn build_tray_menu(
+    app: &tauri::AppHandle,
+    background_on: bool,
+) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem};
+
+    let status = MenuItemBuilder::with_id("tray_status", "Status: 🟢 Available")
+        .enabled(false)
+        .build(app)?;
+    let open = MenuItemBuilder::with_id(TRAY_OPEN, "Open Window").build(app)?;
+    let toggle = MenuItemBuilder::with_id(
+        TRAY_TOGGLE_RECEIVE,
+        if background_on {
+            "Receiving in background: ✓ Enabled"
+        } else {
+            "Receiving in background: Disabled"
+        },
+    )
+    .build(app)?;
+    let settings = MenuItemBuilder::with_id(TRAY_SETTINGS, "Settings").build(app)?;
+    let quit = MenuItemBuilder::with_id(TRAY_QUIT, "Quit Nexo").build(app)?;
+
+    MenuBuilder::new(app)
+        .item(&status)
+        .separator()
+        .item(&open)
+        .item(&toggle)
+        .item(&settings)
+        .item(&PredefinedMenuItem::separator(app)?)
+        .item(&quit)
+        .build()
+}
+
+/// Shows and focuses the main window, creating nothing new (the window always
+/// exists; closing only hides it).
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+/// Navigates the UI to a screen by emitting an event the frontend listens for.
+fn focus_screen(app: &tauri::AppHandle, screen: &str) {
+    show_main_window(app);
+    let _ = app.emit("navigate", screen);
+}
+
 pub fn run() {
+    use tauri::tray::TrayIconBuilder;
+    use tauri::{Manager, WindowEvent};
+
     tauri::Builder::default()
         .setup(|app| {
             let config = build_config(app.handle());
-            app.manage(DesktopAppState::new(config));
+            let state = DesktopAppState::new(config);
+            let background_on = state.store.background_settings().background_receiving;
+            app.manage(state);
+
+            // Feature 1: system tray with a live status + controls menu.
+            let menu = build_tray_menu(app.handle(), background_on)?;
+            let _tray = TrayIconBuilder::with_id("nexo-tray")
+                .icon(app.default_window_icon().cloned().ok_or("missing icon")?)
+                .tooltip("Nexo — available")
+                .menu(&menu)
+                .show_menu_on_left_click(true)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    TRAY_OPEN => show_main_window(app),
+                    TRAY_SETTINGS => focus_screen(app, "settings"),
+                    TRAY_TOGGLE_RECEIVE => {
+                        // Flip the persisted background toggle from the tray.
+                        let state = app.state::<DesktopAppState>();
+                        let mut settings = state.store.background_settings();
+                        settings.background_receiving = !settings.background_receiving;
+                        state.store.set_background_settings(settings);
+                        if settings.background_receiving {
+                            let _ = spawn_receive_job(app, &state);
+                        }
+                        if let Ok(menu) = build_tray_menu(app, settings.background_receiving)
+                            && let Some(tray) = app.tray_by_id("nexo-tray")
+                        {
+                            let _ = tray.set_menu(Some(menu));
+                        }
+                        let _ = app.emit("background_settings_changed", ());
+                    }
+                    TRAY_QUIT => {
+                        // Feature 3 shutdown: dropping app state drops the receive
+                        // thread's discovery advertisement (ServiceAdvertisement
+                        // unregisters on drop), then exit.
+                        app.exit(0);
+                    }
+                    _ => {}
+                })
+                .build(app)?;
+
+            // Feature 3 startup: if background receiving is enabled, start the
+            // receiver immediately so the device is discoverable without the
+            // user pressing anything.
+            if background_on {
+                let handle = app.handle().clone();
+                let state = app.state::<DesktopAppState>();
+                let _ = spawn_receive_job(&handle, &state);
+            }
+
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // Feature 1/2: closing the window hides to tray instead of quitting,
+            // as long as background receiving is enabled. With it disabled, the
+            // close proceeds and the app exits (stopping the receiver).
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                let app = window.app_handle();
+                let background_on = app
+                    .state::<DesktopAppState>()
+                    .store
+                    .background_settings()
+                    .background_receiving;
+                if background_on {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             get_settings,
             get_state_paths,
             get_status,
             get_receiver_endpoint,
+            get_receiver_status,
+            get_background_settings,
+            set_background_settings,
             discover_known_peers,
             start_receive,
             create_transfer_request,
@@ -1469,7 +1695,10 @@ mod tests {
             .expect("lock")
             .insert("in-2".to_owned(), pending);
         signal_incoming(&incoming, "in-2", false).expect("reject");
-        assert!(!reject_rx.recv().expect("decision"), "reject delivers false");
+        assert!(
+            !reject_rx.recv().expect("decision"),
+            "reject delivers false"
+        );
 
         // Unknown id is an error, not a silent success.
         assert!(signal_incoming(&incoming, "missing", true).is_err());
@@ -1484,5 +1713,44 @@ mod tests {
             "nexo-desktop-{label}-{}-{unique}",
             std::process::id()
         ))
+    }
+
+    fn state_with_store(label: &str) -> DesktopAppState {
+        DesktopAppState::new(CliConfig {
+            state_dir: temp_path(label),
+            receive_dir: temp_path(&format!("{label}-recv")),
+            chunk_size: 8,
+        })
+    }
+
+    #[test]
+    fn background_mode_defaults_on_so_receiver_autostarts() {
+        // Feature 3: a fresh install defaults to background receiving ON, which
+        // is what drives the auto-start on setup.
+        let state = state_with_store("bg-default");
+        assert!(state.store.background_settings().background_receiving);
+    }
+
+    #[test]
+    fn disabling_background_mode_persists_and_stops_autostart() {
+        // Feature 2 "disable mode": turning it off is persisted, so the next
+        // launch / window-close does not keep the receiver alive.
+        let state = state_with_store("bg-disable");
+        state
+            .store
+            .set_background_settings(store::BackgroundSettings {
+                background_receiving: false,
+                start_on_login: false,
+            });
+        assert!(!state.store.background_settings().background_receiving);
+    }
+
+    #[test]
+    fn tray_menu_ids_are_distinct() {
+        // Guards against duplicate menu ids that would make tray actions
+        // ambiguous.
+        let ids = [TRAY_OPEN, TRAY_TOGGLE_RECEIVE, TRAY_SETTINGS, TRAY_QUIT];
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len());
     }
 }

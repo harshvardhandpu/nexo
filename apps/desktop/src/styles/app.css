@@ -858,6 +858,69 @@
   border-color: rgba(52, 211, 153, 0.4);
 }
 
+/* ===== Toggle switch ====================================================== */
+.toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+  padding: 6px 2px;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.toggle-row:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.toggle-row__text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.toggle-row__text strong {
+  font-size: 14px;
+  font-weight: 600;
+}
+.toggle-row__text span {
+  font-size: 12.5px;
+  max-width: 52ch;
+}
+.switch {
+  flex: 0 0 auto;
+  width: 46px;
+  height: 26px;
+  border-radius: var(--radius-pill);
+  background: rgba(4, 6, 14, 0.7);
+  border: 1px solid var(--glass-border);
+  padding: 2px;
+  transition: background var(--dur) var(--ease);
+}
+.switch__knob {
+  display: block;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  transform: translateX(0);
+  transition:
+    transform var(--dur) var(--ease),
+    background var(--dur) var(--ease);
+}
+.switch--on {
+  background: var(--accent-grad);
+  border-color: transparent;
+  box-shadow: var(--glow-cyan);
+}
+.switch--on .switch__knob {
+  transform: translateX(20px);
+  background: #04121a;
+}
+
 /* ===== Presence indicator ================================================= */
 .presence-dot {
   position: absolute;

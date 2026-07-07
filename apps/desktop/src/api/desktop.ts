@@ -1,5 +1,35 @@
 import { invoke } from "@tauri-apps/api/core";
 
+export type BackgroundSettings = {
+  backgroundReceiving: boolean;
+  startOnLogin: boolean;
+};
+
+export type ReceiverStatus = {
+  receiving: boolean;
+  discoverable: boolean;
+  backgroundEnabled: boolean;
+  endpoint: string | null;
+};
+
+export function getBackgroundSettings() {
+  return invoke<BackgroundSettings>("get_background_settings");
+}
+
+export function setBackgroundSettings(
+  backgroundReceiving: boolean,
+  startOnLogin: boolean,
+) {
+  return invoke<BackgroundSettings>("set_background_settings", {
+    backgroundReceiving,
+    startOnLogin,
+  });
+}
+
+export function getReceiverStatus() {
+  return invoke<ReceiverStatus>("get_receiver_status");
+}
+
 export type DesktopSettings = {
   stateDir: string;
   receiveDir: string;

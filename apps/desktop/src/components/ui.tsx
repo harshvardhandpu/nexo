@@ -233,3 +233,36 @@ export function Empty({
 export function Spinner() {
   return <Loader2 size={16} className="spin" />;
 }
+
+/* ---- Toggle switch ------------------------------------------------------- */
+export function Toggle({
+  checked,
+  onChange,
+  label,
+  hint,
+  disabled,
+}: {
+  checked: boolean;
+  onChange: (next: boolean) => void;
+  label: string;
+  hint?: string;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      className="toggle-row"
+      onClick={() => !disabled && onChange(!checked)}
+      disabled={disabled}
+      aria-pressed={checked}
+    >
+      <span className="toggle-row__text">
+        <strong>{label}</strong>
+        {hint ? <span className="text-faint">{hint}</span> : null}
+      </span>
+      <span className={`switch ${checked ? "switch--on" : ""}`}>
+        <span className="switch__knob" />
+      </span>
+    </button>
+  );
+}
