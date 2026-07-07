@@ -113,8 +113,34 @@ export type TransferRequest = {
   status: string;
 };
 
-/** Event name the backend emits when a request needs confirmation. */
+/** Event name the backend emits when a send request needs confirmation. */
 export const TRANSFER_REQUEST_EVENT = "transfer_request_created";
+
+/** Event name emitted when an incoming transfer needs the receiver's approval. */
+export const INCOMING_TRANSFER_EVENT = "incoming_transfer_request";
+
+export type IncomingTransfer = {
+  id: string;
+  sender: string;
+  filename: string;
+  fileSize: number;
+  checksum: string;
+  timestamp: number;
+};
+
+/** Receiver step: accept an incoming transfer — the parked receive continues. */
+export function approveIncomingRequest(requestId: string) {
+  return invoke<void>("approve_incoming_request", { requestId });
+}
+
+/** Receiver step: reject an incoming transfer — the sender is told, no file. */
+export function rejectIncomingRequest(requestId: string) {
+  return invoke<void>("reject_incoming_request", { requestId });
+}
+
+export function listIncomingRequests() {
+  return invoke<IncomingTransfer[]>("list_incoming_requests");
+}
 
 /**
  * AirDrop step 1: create a *pending* transfer request. This does NOT start a

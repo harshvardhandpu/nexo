@@ -50,7 +50,13 @@ pub struct CliArgs {
 #[derive(Debug, Subcommand)]
 enum CliCommand {
     Discover,
-    Receive,
+    Receive {
+        /// Skip the interactive "Accept incoming file?" confirmation and accept
+        /// automatically. Intended for scripting/testing only; the default
+        /// requires the receiver to confirm each incoming transfer.
+        #[arg(long)]
+        auto_accept: bool,
+    },
     Send {
         file: PathBuf,
         #[arg(long)]
@@ -183,7 +189,7 @@ pub fn main_entry() -> CliResult<()> {
 pub fn run_cli<W: Write>(args: CliArgs, config: &CliConfig, output: &mut W) -> CliResult<()> {
     match args.command {
         CliCommand::Discover => run_discover(config, output),
-        CliCommand::Receive => run_receive(config, output),
+        CliCommand::Receive { auto_accept } => run_receive_command(config, output, auto_accept),
         CliCommand::Send {
             file,
             host,
@@ -270,7 +276,119 @@ where
     run_cli(args, config, output)
 }
 
+/// Lifecycle of an incoming transfer awaiting the receiver's decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncomingRequestStatus {
+    Pending,
+    Accepted,
+    Rejected,
+    Cancelled,
+}
+
+/// An incoming transfer the receiver must approve before any data is written.
+/// Built from the sender's request metadata; carries no file handles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncomingTransferRequest {
+    pub id: String,
+    pub sender: String,
+    pub filename: String,
+    pub file_size: u64,
+    pub checksum: String,
+    pub timestamp: u64,
+    pub status: IncomingRequestStatus,
+}
+
+impl IncomingTransferRequest {
+    fn from_request(request: &TransferRequest) -> Self {
+        Self {
+            id: request.transfer_id.0.clone(),
+            sender: request.from_peer.0.clone(),
+            filename: request.manifest.name.clone(),
+            file_size: request.manifest.size,
+            checksum: request.manifest.sha256.clone(),
+            timestamp: unix_timestamp(),
+            status: IncomingRequestStatus::Pending,
+        }
+    }
+}
+
+fn unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// Builds the protocol's existing rejection response for a request. Uses only
+/// `common` message types — no new wire format.
+fn rejection_envelope(request: &TransferRequest, reason: &str) -> MessageEnvelope {
+    MessageEnvelope {
+        session_id: request.session_id.clone(),
+        transfer_id: request.transfer_id.clone(),
+        message: TransferMessage::Session(TransferSessionMessage::Response(
+            TransferResponse::Rejected(common::TransferRejection {
+                session_id: request.session_id.clone(),
+                reason: reason.to_owned(),
+            }),
+        )),
+    }
+}
+
+/// Receiver executor: accepts and completes one incoming transfer. Auto-accepts
+/// (no prompt) — it is the unchanged post-approval path, analogous to how
+/// `run_send` is the executor behind `run_send_gated`. Existing callers/tests
+/// use this directly to drive an already-approved transfer.
 pub fn run_receive<W: Write>(config: &CliConfig, output: &mut W) -> CliResult<()> {
+    run_receive_gated(config, output, |_| true)
+}
+
+/// CLI `receive`: requires an interactive "Accept incoming file?" confirmation
+/// by default; `--auto-accept` pre-approves for scripting/testing.
+fn run_receive_command<W: Write>(
+    config: &CliConfig,
+    output: &mut W,
+    auto_accept: bool,
+) -> CliResult<()> {
+    if auto_accept {
+        run_receive_gated(config, output, |request| {
+            println!("auto-accept: accepting incoming {}", request.filename);
+            true
+        })
+    } else {
+        run_receive_gated(config, output, confirm_incoming_on_terminal)
+    }
+}
+
+/// Blocking accept/reject prompt on the controlling terminal. Any non-`y`
+/// answer (including EOF / non-interactive stdin) rejects, so a receiver never
+/// accepts a transfer by accident.
+fn confirm_incoming_on_terminal(request: &IncomingTransferRequest) -> bool {
+    use std::io::Write as _;
+    println!("\nIncoming transfer request:");
+    println!("  Device: {}", request.sender);
+    println!("  File:   {}", request.filename);
+    println!("  Size:   {} bytes", request.file_size);
+    print!("Accept? [y/N] ");
+    if std::io::stdout().flush().is_err() {
+        return false;
+    }
+    let mut answer = String::new();
+    match std::io::stdin().read_line(&mut answer) {
+        Ok(0) | Err(_) => false,
+        Ok(_) => matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
+    }
+}
+
+/// Consent-gated receive: reads the incoming transfer's metadata, asks the
+/// supplied approver, and only continues into the unchanged receive path if it
+/// returns `true`. On rejection it sends the protocol's existing
+/// `TransferResponse::Rejected` and closes cleanly — crucially *before* any
+/// output file is created, so a rejected transfer leaves nothing on disk.
+pub fn run_receive_gated<W, F>(config: &CliConfig, output: &mut W, approve: F) -> CliResult<()>
+where
+    W: Write,
+    F: FnOnce(&IncomingTransferRequest) -> bool,
+{
     fs::create_dir_all(&config.state_dir)?;
     fs::create_dir_all(&config.receive_dir)?;
 
@@ -304,6 +422,29 @@ pub fn run_receive<W: Write>(config: &CliConfig, output: &mut W) -> CliResult<()
     let request_envelope = stream.receive_message()?;
     let request = request_from_envelope(&request_envelope)?;
     let metadata = receive_chunk_metadata(&mut stream, &request)?;
+
+    // Receiver-side approval gate. We now know the sender, filename, size, and
+    // whole-file checksum, but have created nothing on disk yet. If the user
+    // rejects, reply with the existing rejection message and close cleanly — no
+    // output file, no checkpoint, no session state. The QUIC keep-alive holds
+    // the connection open while we wait for the decision.
+    let incoming = IncomingTransferRequest::from_request(&request);
+    writeln!(
+        output,
+        "incoming: {} ({} bytes) from {}",
+        incoming.filename, incoming.file_size, incoming.sender
+    )?;
+    if !approve(&incoming) {
+        stream.send_message(rejection_envelope(
+            &request,
+            "receiver rejected the transfer",
+        ))?;
+        stream.close().ok();
+        writeln!(output, "rejected incoming transfer: {}", incoming.filename)?;
+        return Ok(());
+    }
+    writeln!(output, "accepted incoming transfer: {}", incoming.filename)?;
+
     let output_path = config.receive_dir.join(&request.manifest.name);
     let mut checkpoint = load_receive_checkpoint(&storage, &request, &metadata, &output_path)?;
 
@@ -1016,6 +1157,15 @@ fn ensure_acceptance(envelope: &MessageEnvelope) -> CliResult<()> {
         TransferMessage::Session(TransferSessionMessage::Response(TransferResponse::Accepted(
             _,
         ))) => Ok(()),
+        // The receiver declined via the existing protocol rejection message.
+        // Surface it as a clear, distinct error rather than a generic protocol
+        // mismatch, so the sender reports "rejected by receiver".
+        TransferMessage::Session(TransferSessionMessage::Response(TransferResponse::Rejected(
+            rejection,
+        ))) => Err(io_error(
+            ErrorKind::PermissionDenied,
+            format!("transfer rejected by receiver: {}", rejection.reason),
+        )),
         _ => Err(io_error(
             ErrorKind::InvalidData,
             "expected transfer acceptance",
@@ -1671,6 +1821,117 @@ mod tests {
         assert!(
             !text.contains("transfer complete"),
             "must not transfer: {text}"
+        );
+    }
+
+    #[test]
+    fn receiver_rejection_cancels_transfer_and_writes_no_file() {
+        // Reject flow: the receiver declines, the sender gets a clear rejection
+        // error, and no output file is created.
+        let workspace = TempWorkspace::new("quic-cli-reject");
+        let source = workspace.path("secret.txt");
+        let receive_dir = workspace.path("received");
+        let state_dir = workspace.path("state");
+        fs::create_dir_all(&receive_dir).expect("receive dir");
+        fs::write(&source, b"do not accept this file").expect("source");
+        let config = CliConfig {
+            state_dir,
+            receive_dir: receive_dir.clone(),
+            chunk_size: 8,
+        };
+        let receive_config = config.clone();
+
+        // Receiver rejects (approver returns false).
+        let receiver = thread::spawn(move || {
+            let mut output = Vec::new();
+            run_receive_gated(&receive_config, &mut output, |_request| false)?;
+            String::from_utf8(output).map_err(|error| {
+                Box::new(IoError::new(ErrorKind::InvalidData, error))
+                    as Box<dyn Error + Send + Sync>
+            })
+        });
+        wait_for_receiver_advert(&config);
+        let advert = load_receiver_advert(&config).expect("receiver advert");
+        let mut send_output = Vec::new();
+
+        let send_result = run_send_gated(
+            &source,
+            Some(advert.address),
+            true,
+            &config,
+            &mut send_output,
+        );
+        let receive_output = receiver
+            .join()
+            .expect("receiver thread")
+            .expect("receive output");
+
+        // Sender saw a rejection, not a generic failure.
+        let error = send_result.expect_err("send must fail when rejected");
+        assert!(
+            error.to_string().contains("rejected by receiver"),
+            "unexpected error: {error}"
+        );
+        // Receiver reported the rejection and created NO output file.
+        assert!(receive_output.contains("rejected incoming transfer"));
+        assert!(
+            !receive_dir.join("secret.txt").exists(),
+            "no file may be created on rejection"
+        );
+    }
+
+    #[test]
+    fn receiver_gated_accept_completes_transfer() {
+        // Accept flow through the gate: approver returns true, transfer completes
+        // and the received bytes match the source exactly.
+        let workspace = TempWorkspace::new("quic-cli-accept");
+        let source = workspace.path("ok.txt");
+        let receive_dir = workspace.path("received");
+        let state_dir = workspace.path("state");
+        let contents = b"nexo receiver approval accept path";
+        fs::create_dir_all(&receive_dir).expect("receive dir");
+        fs::write(&source, contents).expect("source");
+        let config = CliConfig {
+            state_dir,
+            receive_dir: receive_dir.clone(),
+            chunk_size: 8,
+        };
+        let receive_config = config.clone();
+
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let accepted_probe = accepted.clone();
+        let receiver = thread::spawn(move || {
+            let mut output = Vec::new();
+            run_receive_gated(&receive_config, &mut output, move |request| {
+                assert_eq!(request.status, IncomingRequestStatus::Pending);
+                assert_eq!(request.filename, "ok.txt");
+                assert_eq!(request.file_size, contents.len() as u64);
+                assert!(!request.checksum.is_empty(), "checksum available");
+                accepted_probe.store(true, std::sync::atomic::Ordering::SeqCst);
+                true
+            })
+        });
+        wait_for_receiver_advert(&config);
+        let advert = load_receiver_advert(&config).expect("receiver advert");
+        let mut send_output = Vec::new();
+
+        run_send_gated(
+            &source,
+            Some(advert.address),
+            true,
+            &config,
+            &mut send_output,
+        )
+        .expect("send after acceptance");
+        receiver
+            .join()
+            .expect("receiver thread")
+            .expect("receive completes");
+
+        assert!(accepted.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            fs::read(receive_dir.join("ok.txt")).expect("received"),
+            contents
         );
     }
 

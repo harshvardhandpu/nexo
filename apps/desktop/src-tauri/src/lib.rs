@@ -1,9 +1,9 @@
 mod store;
 
 use cli::{
-    CliConfig, CliStatePaths, DiscoveredPeer, ReceiverEndpoint, TransferStatusSnapshot,
-    build_transfer_request, discover_peers, receiver_endpoint, run_receive, run_send,
-    transfer_status_snapshot,
+    CliConfig, CliStatePaths, DiscoveredPeer, IncomingTransferRequest, ReceiverEndpoint,
+    TransferStatusSnapshot, build_transfer_request, discover_peers, receiver_endpoint,
+    run_receive_gated, run_send, transfer_status_snapshot,
 };
 use engine::chunker::default_chunk_size;
 use serde::{Deserialize, Serialize};
@@ -11,14 +11,17 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tauri::{Emitter, Manager, State};
 
 type DesktopResult<T> = Result<T, String>;
 
-/// Event name emitted when a pending AirDrop request needs user confirmation.
+/// Event name emitted when a pending AirDrop send request needs confirmation.
 const TRANSFER_REQUEST_EVENT: &str = "transfer_request_created";
+/// Event name emitted when an incoming transfer needs the receiver's approval.
+const INCOMING_TRANSFER_EVENT: &str = "incoming_transfer_request";
 
 #[derive(Debug)]
 pub struct DesktopAppState {
@@ -28,6 +31,7 @@ pub struct DesktopAppState {
     stress: Arc<Mutex<HashMap<u64, StressRun>>>,
     next_stress_id: AtomicU64,
     requests: Arc<Mutex<HashMap<String, PendingTransferRequest>>>,
+    incoming: Arc<Mutex<HashMap<String, PendingIncoming>>>,
     store: Arc<store::AppStore>,
     presence: Arc<Mutex<HashMap<String, PeerPresence>>>,
 }
@@ -42,6 +46,7 @@ impl DesktopAppState {
             stress: Arc::new(Mutex::new(HashMap::new())),
             next_stress_id: AtomicU64::new(1),
             requests: Arc::new(Mutex::new(HashMap::new())),
+            incoming: Arc::new(Mutex::new(HashMap::new())),
             store,
             presence: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -84,6 +89,40 @@ pub struct PeerDevice {
     pub last_seen: u64,
     pub online: bool,
     pub trusted: bool,
+}
+
+/// UI-facing view of an incoming transfer awaiting the receiver's decision
+/// (the modal payload for `incoming_transfer_request`).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IncomingTransferResponse {
+    pub id: String,
+    pub sender: String,
+    pub filename: String,
+    pub file_size: u64,
+    pub checksum: String,
+    pub timestamp: u64,
+}
+
+impl From<&IncomingTransferRequest> for IncomingTransferResponse {
+    fn from(request: &IncomingTransferRequest) -> Self {
+        Self {
+            id: request.id.clone(),
+            sender: request.sender.clone(),
+            filename: request.filename.clone(),
+            file_size: request.file_size,
+            checksum: request.checksum.clone(),
+            timestamp: request.timestamp,
+        }
+    }
+}
+
+/// A receive thread parked on the approval gate: the UI-facing view plus the
+/// channel used to deliver the user's accept/reject decision.
+#[derive(Debug)]
+struct PendingIncoming {
+    response: IncomingTransferResponse,
+    decision: SyncSender<bool>,
 }
 
 /// Immutable facts about a transfer captured when its job is spawned, used to
@@ -500,7 +539,10 @@ fn discover_known_peers(state: State<'_, DesktopAppState>) -> DesktopResult<Vec<
 }
 
 #[tauri::command]
-fn start_receive(state: State<'_, DesktopAppState>) -> DesktopResult<StartJobResponse> {
+fn start_receive(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopAppState>,
+) -> DesktopResult<StartJobResponse> {
     let config = state.config();
     let job_id = state.next_job_id();
     insert_job(
@@ -508,6 +550,37 @@ fn start_receive(state: State<'_, DesktopAppState>) -> DesktopResult<StartJobRes
         job_id,
         TransferJob::running(TransferJobKind::Receive),
     )?;
+
+    // Receiver-side approval gate. The approver runs on the receive thread when
+    // the sender's metadata arrives: it emits `incoming_transfer_request` and
+    // blocks until the UI answers via approve_/reject_incoming_request. The QUIC
+    // keep-alive holds the connection open while it waits. Never auto-accepts.
+    let incoming = state.incoming.clone();
+    let approver = move |request: &IncomingTransferRequest| -> bool {
+        let response = IncomingTransferResponse::from(request);
+        let (decision_tx, decision_rx) = std::sync::mpsc::sync_channel::<bool>(1);
+        {
+            let Ok(mut pending) = incoming.lock() else {
+                return false;
+            };
+            pending.insert(
+                response.id.clone(),
+                PendingIncoming {
+                    response: response.clone(),
+                    decision: decision_tx,
+                },
+            );
+        }
+        if app.emit(INCOMING_TRANSFER_EVENT, response.clone()).is_err() {
+            incoming.lock().ok().map(|mut map| map.remove(&response.id));
+            return false;
+        }
+        // Wait for the user's decision (default reject if the channel drops).
+        let accepted = decision_rx.recv().unwrap_or(false);
+        incoming.lock().ok().map(|mut map| map.remove(&response.id));
+        accepted
+    };
+
     spawn_transfer_job(
         state.jobs.clone(),
         job_id,
@@ -519,10 +592,60 @@ fn start_receive(state: State<'_, DesktopAppState>) -> DesktopResult<StartJobRes
             filename: "(incoming)".to_owned(),
             peer: "incoming".to_owned(),
         },
-        move |output| run_receive(&config, output),
+        move |output| run_receive_gated(&config, output, approver),
     );
 
     Ok(StartJobResponse { job_id })
+}
+
+#[tauri::command]
+fn approve_incoming_request(
+    request_id: String,
+    state: State<'_, DesktopAppState>,
+) -> DesktopResult<()> {
+    signal_incoming(&state.incoming, &request_id, true)
+}
+
+#[tauri::command]
+fn reject_incoming_request(
+    request_id: String,
+    state: State<'_, DesktopAppState>,
+) -> DesktopResult<()> {
+    signal_incoming(&state.incoming, &request_id, false)
+}
+
+#[tauri::command]
+fn list_incoming_requests(
+    state: State<'_, DesktopAppState>,
+) -> DesktopResult<Vec<IncomingTransferResponse>> {
+    let incoming = state
+        .incoming
+        .lock()
+        .map_err(|_| "desktop incoming registry is unavailable".to_owned())?;
+    Ok(incoming
+        .values()
+        .map(|pending| pending.response.clone())
+        .collect())
+}
+
+fn signal_incoming(
+    incoming: &Arc<Mutex<HashMap<String, PendingIncoming>>>,
+    request_id: &str,
+    accepted: bool,
+) -> DesktopResult<()> {
+    let pending = incoming
+        .lock()
+        .map_err(|_| "desktop incoming registry is unavailable".to_owned())?
+        .remove(request_id);
+    match pending {
+        // Best-effort: if the receive thread already gave up, the send fails
+        // closed with the channel error and the decision is a no-op.
+        Some(pending) => {
+            let _ = pending.decision.send(accepted);
+            Ok(())
+        }
+        None => Err(format!("unknown incoming transfer request: {request_id}")),
+    }
 }
 
 #[tauri::command]
@@ -910,6 +1033,9 @@ pub fn run() {
             approve_transfer_request,
             reject_transfer_request,
             list_transfer_requests,
+            approve_incoming_request,
+            reject_incoming_request,
+            list_incoming_requests,
             list_devices,
             list_trusted_devices,
             trust_device,
@@ -1301,6 +1427,52 @@ mod tests {
 
         assert!(first.is_some(), "first approve finds the pending request");
         assert!(second.is_none(), "second approve finds nothing to run");
+    }
+
+    fn pending_incoming(id: &str) -> (PendingIncoming, std::sync::mpsc::Receiver<bool>) {
+        let (decision, rx) = std::sync::mpsc::sync_channel::<bool>(1);
+        (
+            PendingIncoming {
+                response: IncomingTransferResponse {
+                    id: id.to_owned(),
+                    sender: "cli-sender".to_owned(),
+                    filename: "movie.iso".to_owned(),
+                    file_size: 5_000_000_000,
+                    checksum: "abc".to_owned(),
+                    timestamp: 0,
+                },
+                decision,
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn approve_and_reject_incoming_signal_the_waiting_receiver() {
+        let incoming: Arc<Mutex<HashMap<String, PendingIncoming>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // Approve delivers `true` to the parked receive thread and clears it.
+        let (pending, accept_rx) = pending_incoming("in-1");
+        incoming
+            .lock()
+            .expect("lock")
+            .insert("in-1".to_owned(), pending);
+        signal_incoming(&incoming, "in-1", true).expect("approve");
+        assert!(accept_rx.recv().expect("decision"), "approve delivers true");
+        assert!(incoming.lock().expect("lock").is_empty());
+
+        // Reject delivers `false`.
+        let (pending, reject_rx) = pending_incoming("in-2");
+        incoming
+            .lock()
+            .expect("lock")
+            .insert("in-2".to_owned(), pending);
+        signal_incoming(&incoming, "in-2", false).expect("reject");
+        assert!(!reject_rx.recv().expect("decision"), "reject delivers false");
+
+        // Unknown id is an error, not a silent success.
+        assert!(signal_incoming(&incoming, "missing", true).is_err());
     }
 
     fn temp_path(label: &str) -> PathBuf {

@@ -4,10 +4,15 @@ import { AlertTriangle, Wifi, WifiOff } from "lucide-react";
 import { Sidebar } from "./components/Sidebar";
 import { TopBar } from "./components/TopBar";
 import { ConfirmDialog } from "./components/ConfirmDialog";
+import { IncomingTransferDialog } from "./components/IncomingTransferDialog";
 import { Banner, StatusPill } from "./components/ui";
 import { useDesktopData } from "./lib/useDesktopData";
 import {
+  INCOMING_TRANSFER_EVENT,
   TRANSFER_REQUEST_EVENT,
+  approveIncomingRequest,
+  rejectIncomingRequest,
+  type IncomingTransfer,
   type TransferRequest,
 } from "./api/desktop";
 import { NAV, TITLES, type Screen } from "./screens/nav";
@@ -28,6 +33,8 @@ export default function App() {
     null,
   );
   const [confirmBusy, setConfirmBusy] = useState(false);
+  const [incoming, setIncoming] = useState<IncomingTransfer | null>(null);
+  const [incomingBusy, setIncomingBusy] = useState(false);
 
   // AirDrop: the backend emits `transfer_request_created` for every send intent.
   // We show the mandatory confirmation modal; no transfer runs until approved.
@@ -39,6 +46,41 @@ export default function App() {
       void unlisten.then((fn) => fn());
     };
   }, []);
+
+  // Receiver-side: the backend emits `incoming_transfer_request` while a receive
+  // is parked on the approval gate. Show the accept/reject modal.
+  useEffect(() => {
+    const unlisten = listen<IncomingTransfer>(
+      INCOMING_TRANSFER_EVENT,
+      (event) => setIncoming(event.payload),
+    );
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  const acceptIncoming = async () => {
+    if (!incoming) return;
+    setIncomingBusy(true);
+    try {
+      await approveIncomingRequest(incoming.id);
+      setIncoming(null);
+      setScreen("monitor");
+    } finally {
+      setIncomingBusy(false);
+    }
+  };
+
+  const rejectIncoming = async () => {
+    if (!incoming) return;
+    setIncomingBusy(true);
+    try {
+      await rejectIncomingRequest(incoming.id);
+    } finally {
+      setIncoming(null);
+      setIncomingBusy(false);
+    }
+  };
 
   const approve = async () => {
     if (!pendingRequest) return;
@@ -133,6 +175,14 @@ export default function App() {
           busy={confirmBusy}
           onApprove={approve}
           onReject={reject}
+        />
+      ) : null}
+      {incoming ? (
+        <IncomingTransferDialog
+          request={incoming}
+          busy={incomingBusy}
+          onAccept={acceptIncoming}
+          onReject={rejectIncoming}
         />
       ) : null}
     </div>

@@ -852,6 +852,11 @@
   grid-template-columns: 1fr 1fr;
   gap: 12px;
 }
+.modal__glyph--incoming {
+  color: var(--success);
+  background: rgba(52, 211, 153, 0.12);
+  border-color: rgba(52, 211, 153, 0.4);
+}
 
 /* ===== Presence indicator ================================================= */
 .presence-dot {
