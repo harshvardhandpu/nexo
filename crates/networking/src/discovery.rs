@@ -2,7 +2,7 @@ use common::PeerId;
 use mdns_sd::{Receiver, ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Error, ErrorKind, Result};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
 pub const NEXO_SERVICE_TYPE: &str = "_nexo._udp.local.";
@@ -365,6 +365,27 @@ impl Drop for ServiceAdvertisement {
 }
 
 fn build_service_info(advertisement: &PeerAdvertisement) -> Result<ServiceInfo> {
+    build_service_info_with(advertisement, &local_advertisable_addresses())
+}
+
+/// Builds the mDNS `ServiceInfo` from an advertisement and an explicit set of
+/// addresses to publish.
+///
+/// Previously this used `enable_addr_auto()`, which makes mdns-sd attach *every*
+/// interface address — including `127.0.0.1` / `::1`. Peers then discovered a
+/// loopback endpoint they could never reach. Instead we publish the caller-
+/// supplied addresses directly (already filtered to reachable, non-loopback
+/// ones) so a discovered peer always exposes a routable LAN address.
+///
+/// Any loopback/unspecified entries are filtered out defensively here too. If no
+/// advertisable address is available (e.g. an isolated CI host), we fall back to
+/// `enable_addr_auto` so the service still registers — loopback is only ever
+/// advertised as this last resort, which keeps localhost-only integration tests
+/// working.
+fn build_service_info_with(
+    advertisement: &PeerAdvertisement,
+    addresses: &[IpAddr],
+) -> Result<ServiceInfo> {
     let properties = HashMap::from([
         (PEER_ID_PROPERTY.to_owned(), advertisement.peer_id.0.clone()),
         (
@@ -373,18 +394,77 @@ fn build_service_info(advertisement: &PeerAdvertisement) -> Result<ServiceInfo> 
         ),
         (VERSION_PROPERTY.to_owned(), DISCOVERY_VERSION.to_owned()),
     ]);
+
+    let advertisable: Vec<IpAddr> = addresses
+        .iter()
+        .copied()
+        .filter(|address| is_advertisable_address(*address))
+        .collect();
+
     let service = ServiceInfo::new(
         NEXO_SERVICE_TYPE,
         &advertisement.peer_id.0,
         &service_hostname(&advertisement.peer_id),
-        "",
+        advertisable.as_slice(),
         advertisement.port,
         properties,
     )
-    .map_err(discovery_error)?
-    .enable_addr_auto();
+    .map_err(discovery_error)?;
 
-    Ok(service)
+    // Only enable automatic (all-interface) address selection when we found no
+    // routable address to publish — otherwise loopback would leak back in.
+    if advertisable.is_empty() {
+        Ok(service.enable_addr_auto())
+    } else {
+        Ok(service)
+    }
+}
+
+/// Non-loopback local addresses suitable for advertising to LAN peers, in
+/// preference order (LAN/Wi-Fi IPv4 first). Loopback, link-local, and other
+/// unreachable ranges are excluded.
+fn local_advertisable_addresses() -> Vec<IpAddr> {
+    let Ok(interfaces) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+
+    let mut addresses: Vec<IpAddr> = interfaces
+        .into_iter()
+        .filter(|interface| interface.is_oper_up() && !interface.is_loopback())
+        .map(|interface| interface.ip())
+        .filter(|address| is_advertisable_address(*address))
+        .collect();
+
+    // Prefer IPv4 (typical LAN/Wi-Fi) before IPv6, and de-duplicate.
+    addresses.sort_by_key(|address| (address.is_ipv6(), address.to_string()));
+    addresses.dedup();
+    addresses
+}
+
+/// Whether an address may be advertised to peers: it must be routable on a
+/// local network. Loopback (`127.0.0.1`, `::1`), unspecified, link-local,
+/// broadcast, multicast, and documentation ranges are never advertised.
+fn is_advertisable_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(v4) => is_advertisable_ipv4(v4),
+        IpAddr::V6(v6) => is_advertisable_ipv6(v6),
+    }
+}
+
+fn is_advertisable_ipv4(address: Ipv4Addr) -> bool {
+    !(address.is_unspecified()
+        || address.is_loopback()
+        || address.is_link_local()
+        || address.is_broadcast()
+        || address.is_multicast()
+        || address.is_documentation())
+}
+
+fn is_advertisable_ipv6(address: Ipv6Addr) -> bool {
+    // `is_unicast_link_local` is unstable on stable Rust; match the fe80::/10
+    // link-local prefix directly.
+    let is_link_local = (address.segments()[0] & 0xffc0) == 0xfe80;
+    !(address.is_unspecified() || address.is_loopback() || address.is_multicast() || is_link_local)
 }
 
 fn validate_advertisement(advertisement: &PeerAdvertisement) -> Result<()> {
@@ -468,6 +548,89 @@ fn resolved_peer_from_service(service: &ResolvedService) -> Option<ResolvedPeer>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn service_addresses(service: &ServiceInfo) -> Vec<IpAddr> {
+        service.get_addresses().iter().copied().collect()
+    }
+
+    #[test]
+    fn advertisement_uses_non_loopback_address() {
+        // A receiver bound to a real LAN address must advertise that address so
+        // discovered peers can connect back to it.
+        let advertisement = PeerAdvertisement::new(PeerId("peer-1".to_owned()), "archlinux", 50038);
+        let lan = IpAddr::V4(Ipv4Addr::new(172, 21, 209, 204));
+
+        let service = build_service_info_with(&advertisement, &[lan]).expect("service info");
+        let addresses = service_addresses(&service);
+
+        assert_eq!(addresses, vec![lan]);
+        assert!(
+            addresses.iter().all(|address| !address.is_loopback()),
+            "advertised addresses must not be loopback: {addresses:?}"
+        );
+        assert_eq!(service.get_port(), 50038);
+    }
+
+    #[test]
+    fn localhost_is_filtered_from_service_info() {
+        // Given both a loopback and a LAN address, only the LAN address is
+        // advertised — 127.0.0.1 / ::1 must never reach discovery.
+        let advertisement = PeerAdvertisement::new(PeerId("peer-2".to_owned()), "archlinux", 60897);
+        let lan = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5));
+        let inputs = [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            lan,
+        ];
+
+        let service = build_service_info_with(&advertisement, &inputs).expect("service info");
+        let addresses = service_addresses(&service);
+
+        assert!(addresses.contains(&lan), "LAN address must be advertised");
+        assert!(
+            !addresses.iter().any(|address| address.is_loopback()),
+            "loopback must be filtered out: {addresses:?}"
+        );
+    }
+
+    #[test]
+    fn is_advertisable_rejects_loopback_and_unreachable_ranges() {
+        // Reachable LAN addresses are advertisable.
+        assert!(is_advertisable_address(IpAddr::V4(Ipv4Addr::new(
+            172, 21, 209, 204
+        ))));
+        assert!(is_advertisable_address(IpAddr::V4(Ipv4Addr::new(
+            192, 168, 1, 5
+        ))));
+        assert!(is_advertisable_address(IpAddr::V4(Ipv4Addr::new(
+            10, 0, 0, 8
+        ))));
+
+        // Loopback and other unreachable ranges are not.
+        assert!(!is_advertisable_address(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(!is_advertisable_address(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(!is_advertisable_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+        assert!(!is_advertisable_address(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 1, 1
+        ))));
+        assert!(!is_advertisable_address(IpAddr::V4(Ipv4Addr::new(
+            224, 0, 0, 1
+        ))));
+        assert!(!is_advertisable_address(IpAddr::V4(Ipv4Addr::BROADCAST)));
+        // fe80::/10 link-local IPv6.
+        assert!(!is_advertisable_address(IpAddr::V6(
+            "fe80::1".parse().unwrap()
+        )));
+    }
+
+    #[test]
+    fn empty_addresses_still_build_a_service() {
+        // On a host with no routable address, the service still registers (via
+        // addr-auto) rather than failing — localhost only as a last resort.
+        let advertisement = PeerAdvertisement::new(PeerId("peer-3".to_owned()), "host", 0);
+        let service = build_service_info_with(&advertisement, &[]).expect("service info");
+        assert!(service.is_addr_auto());
+    }
 
     #[test]
     fn peer_cache_discovers_updates_lists_and_removes_peers() {

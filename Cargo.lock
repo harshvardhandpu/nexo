@@ -2309,6 +2309,7 @@ dependencies = [
  "bincode",
  "common",
  "flume",
+ "if-addrs",
  "mdns-sd",
  "quinn",
  "rcgen",
