@@ -27,7 +27,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["appimage", "deb"],
+    "targets": ["appimage", "deb", "msi"],
+    "publisher": "Nexo",
+    "homepage": "https://github.com/harshvardhandpu/nexo",
     "category": "Utility",
     "shortDescription": "Encrypted, resumable peer-to-peer file transfer",
     "longDescription": "Nexo moves large files directly between devices over encrypted QUIC with chunk-level integrity and crash-safe resume — no cloud, no accounts. A premium, animated desktop experience similar to AirDrop and LocalSend.",
@@ -41,6 +43,15 @@
     "linux": {
       "deb": {
         "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0"]
+      }
+    },
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      },
+      "allowDowngrades": true,
+      "wix": {
+        "language": "en-US"
       }
     }
   }

@@ -2,11 +2,14 @@
 
 # Nexo
 
-### Fast, encrypted, peer-to-peer file transfer
+### Fast, private, peer-to-peer file transfers without cloud storage
 
-Move large files directly between your devices over the local network —
-**end-to-end encrypted**, **resumable**, and **cloud-free**. Like AirDrop, but
-cross-platform and open.
+**Nexo lets you transfer files directly between your devices. Your files do not
+live on a cloud server.** No uploads, no accounts, no size limits imposed by
+someone else's disk — just an encrypted, direct connection from your device to
+theirs.
+
+[Install](#installation) · [Features](#features) · [How it works](#how-it-works) · [Screenshots](#screenshots)
 
 </div>
 
@@ -14,136 +17,149 @@ cross-platform and open.
 
 ## Why Nexo
 
-Most "quick share" tools bounce your files through a cloud server, cap your file
-size, or fall over on a flaky connection. Nexo connects your devices **directly**
-over an encrypted [QUIC](https://www.chromium.org/quic/) channel, verifies every
-byte with SHA-256, and **resumes exactly where it left off** if the link drops —
-so a 5 GB transfer survives a closed laptop lid.
+Most "send a big file" tools upload your file to a company's servers first, then
+give the other person a link to download it. Your file sits on someone else's
+computer, often with a size cap and an expiry date.
+
+Nexo doesn't do that. When you send a file, it goes **straight from your device
+to the other device** over an encrypted connection. Nothing is uploaded to a
+Nexo server — because there isn't one holding your files.
+
+- **No upload servers.** Your files never touch our infrastructure.
+- **Direct device-to-device transfer.** The bytes travel from you to them.
+- **Encrypted.** The connection is end-to-end encrypted.
+- **Resumes if interrupted.** Close your laptop mid-transfer? It picks up where
+  it left off instead of starting over.
+
+Think of it as **AirDrop for every platform** — for your own devices and the
+people next to you.
 
 ## Features
 
-- ✅ **QUIC transport** — modern, multiplexed, encrypted-by-default UDP transport
-- ✅ **Resume** — crash-safe, incremental checkpoints; interrupted transfers pick up mid-file
-- ✅ **End-to-end encryption** — per-session keys; the transport is TLS 1.3 (QUIC)
-- ✅ **No cloud** — files go device→device; nothing is uploaded to a server
-- ✅ **LAN discovery** — devices find each other automatically over mDNS
-- ✅ **Explicit consent** — both sender and receiver approve every transfer; trusted-device auto-accept is opt-in
-- ✅ **Integrity verified** — per-chunk + whole-file SHA-256; zero silent corruption
-- ✅ **Desktop app** — premium dark UI, system tray, background receiver, notifications, onboarding
-- ✅ **Cross-platform** — Linux (AppImage/deb) and Windows (MSI)
-
-## How it works
-
-```
-   Device A                          Device B
- ┌──────────┐   mDNS discovery     ┌──────────┐
- │  Nexo    │◀────────────────────▶│  Nexo    │
- │          │                      │          │
- │  send ──▶│  1. sender approves  │          │
- │          │  2. receiver approves│◀─ accept │
- │          │═════ QUIC (TLS 1.3) ═│          │
- │          │  chunked + SHA-256   │          │
- │          │  resumable transfer  │─▶ file   │
- └──────────┘                      └──────────┘
-        no cloud · no account · encrypted end to end
-```
-
-1. **Discover** — devices advertise over mDNS on the local network.
-2. **Request** — the sender picks a device and confirms.
-3. **Approve** — the receiver accepts (or auto-accepts a trusted device).
-4. **Transfer** — the file is chunked, encrypted, streamed over QUIC, and
-   verified. If interrupted, it resumes from the last checkpoint.
+- ✅ **Direct peer-to-peer transfers** — files go device to device, not through the cloud
+- ✅ **End-to-end encrypted connections** — secured with modern encryption (QUIC / TLS 1.3)
+- ✅ **Resume interrupted transfers** — a dropped connection continues, it doesn't restart
+- ✅ **Large file support** — send multi-gigabyte files without a cloud size cap
+- ✅ **LAN discovery** — nearby devices find each other automatically
+- ✅ **Device trust** — remember and verify the devices you transfer with
+- ✅ **Transfer approval** — both sender and receiver confirm every transfer
+- ✅ **Background receiving** — stay ready to receive from the system tray
+- ✅ **Cross-platform desktop app** — Linux and Windows (macOS coming later)
 
 ## Screenshots
 
-> _Desktop app — Midnight Flow theme (dark, glass, cyan→purple)._
->
-> Dashboard · Devices · Send (drag & drop) · Transfer monitor · Trusted devices ·
-> History · Settings · Onboarding.
->
-> _(Add PNGs under `docs/screenshots/` and link them here when capturing on a
-> machine with a display.)_
+> _Nexo desktop app — dark "Midnight Flow" theme._
 
-## Install
+| Dashboard | Send |
+|---|---|
+| ![Dashboard](docs/screenshots/dashboard.png) | ![Send a file](docs/screenshots/send.png) |
 
-**Linux** — download the AppImage or `.deb` from the
-[latest release](https://github.com/harshvardhandpu/nexo/releases):
+| Receive approval | Transfer progress |
+|---|---|
+| ![Receive approval](docs/screenshots/receive-approval.png) | ![Transfer progress](docs/screenshots/transfer-progress.png) |
 
-```bash
-# AppImage (any distro)
-chmod +x Nexo-linux.AppImage && ./Nexo-linux.AppImage
+| Settings |
+|---|
+| ![Settings](docs/screenshots/settings.png) |
 
-# Debian / Ubuntu
-sudo apt install ./Nexo-linux.deb
-```
+_(Screenshots are added under [`docs/screenshots/`](docs/screenshots/); until then
+the images above are placeholders.)_
 
-Full instructions (dependencies, tray setup, autostart, troubleshooting):
-[`docs/linux-install.md`](docs/linux-install.md).
+## Installation
 
-**Windows** — run the `Nexo-windows.msi` installer.
+### Linux
 
-## Command line
+Download from the [latest release](https://github.com/harshvardhandpu/nexo/releases):
 
-Nexo also ships a CLI (used by the desktop app under the hood):
+- **AppImage** (works on any distro — no install, just run):
+  ```bash
+  chmod +x Nexo-linux.AppImage
+  ./Nexo-linux.AppImage
+  ```
+- **`.deb`** (Debian / Ubuntu / Mint / Pop!_OS):
+  ```bash
+  sudo apt install ./Nexo-linux.deb
+  ```
 
-```bash
-nexo --version
-nexo receive               # advertise + receive (asks to accept each transfer)
-nexo discover              # list nearby devices
-nexo send FILE --host ADDR # send to a discovered device
-```
+Full guide (dependencies, tray, autostart, troubleshooting):
+**[docs/linux-install.md](docs/linux-install.md)**.
 
-## Build from source
+### Windows
 
-Prerequisites: Rust (stable), Node ≥ 18, and the Linux system libraries in
-[`docs/linux-install.md`](docs/linux-install.md).
+Download **`Nexo-windows.msi`** from the
+[latest release](https://github.com/harshvardhandpu/nexo/releases), run the
+installer, and launch **Nexo** from the Start Menu.
+
+Full guide (firewall, discovery, antivirus, VPN):
+**[docs/windows-install.md](docs/windows-install.md)**.
+
+### macOS
+
+**Coming later.** macOS builds are on the roadmap but not available yet.
+
+### Build from source
+
+Prerequisites: [Rust](https://rustup.rs) (stable), [Node.js](https://nodejs.org)
+≥ 18, and the platform libraries noted in the install guides above.
 
 ```bash
 git clone https://github.com/harshvardhandpu/nexo
-cd nexo
-
-# Rust workspace (core engine + CLI)
-cargo test --workspace
-cargo run -p cli -- --help
-
-# Desktop app
-cd apps/desktop
+cd nexo/apps/desktop
 npm ci
-npm run tauri dev          # develop
-npm run tauri build        # package AppImage + deb
+npm run tauri dev            # run the app
+npm run tauri build          # build an installer for your platform
 ```
 
-## Architecture
+## How it works
 
-Nexo is a Rust workspace with a thin Tauri + React desktop layer on top:
+Sending a file with Nexo is four simple steps — and your file never leaves your
+control:
 
-| Crate / dir | Responsibility |
-|---|---|
-| `crates/networking` | QUIC transport + mDNS discovery |
-| `crates/engine` | chunking, transfer pipeline, SHA-256 verification |
-| `crates/storage` | SQLite checkpoint / resume / session persistence |
-| `crates/crypto` | session key exchange + AEAD |
-| `crates/common` | shared types + transfer protocol messages |
-| `crates/cli` | orchestration + command-line app |
-| `apps/desktop` | Tauri (Rust bridge) + React UI |
+1. **Find** — open Nexo on both devices. On the same network, they discover each
+   other automatically. (You can also type the other device's address.)
+2. **Send** — pick the device and choose a file. You confirm you want to send it.
+3. **Accept** — the other person sees an approval prompt with the file name and
+   size, and clicks **Accept**. Nothing transfers until they agree.
+4. **Transfer** — the file streams **directly** from your device to theirs, fully
+   encrypted, and is verified for integrity on arrival. If the connection drops,
+   it resumes automatically.
 
-The transfer engine is stable and frozen; the desktop app only calls its public
-APIs. See [`docs/`](docs/) for the protocol, transport, session, update system,
-and release process.
+```
+   Your device                                  Their device
+ ┌─────────────┐   1. discover on the network  ┌─────────────┐
+ │             │◀─────────────────────────────▶│             │
+ │  2. send ──▶│   you confirm                 │             │
+ │             │   3. they accept ◀────────────│  ✅ accept  │
+ │   ═══════ encrypted direct transfer ═══════▶│  📄 file    │
+ │             │   resumes if interrupted      │             │
+ └─────────────┘                               └─────────────┘
+         no cloud · no account · encrypted end to end
+```
 
-## Security
+## Privacy & security
 
-- Transport is QUIC (TLS 1.3); payloads are additionally encrypted with
-  per-session keys.
-- Every transfer requires explicit sender **and** receiver approval. Auto-accept
-  is limited to devices you have explicitly trusted and is off by default.
-- Certificate trust is never bypassed by any UI setting.
+- Your files are transferred **directly** between devices and are **never**
+  uploaded to a Nexo server.
+- Connections are **end-to-end encrypted**.
+- **Every** transfer requires approval from both the sender and the receiver.
+  Auto-accepting from a device is optional, off by default, and only ever applies
+  to devices you've explicitly trusted.
+
+## Documentation
+
+- [Install on Linux](docs/linux-install.md)
+- [Install on Windows](docs/windows-install.md)
+- [Nexo 2.0 roadmap — global share links](docs/roadmap/nexo-2-share-links.md)
+- [Release checklist](docs/release-checklist.md)
+
+For contributors, the `docs/` folder also covers the transport, protocol,
+session layer, and transfer pipeline.
 
 ## Status
 
-**1.0 Release Candidate.** Core transfer engine complete; desktop app feature
-complete (tray, background receiver, notifications, onboarding, autostart,
-diagnostics). See [`docs/release-checklist.md`](docs/release-checklist.md).
+**Nexo 1.0 (release candidate).** Desktop app feature-complete: encrypted QUIC
+transfers, resume, LAN discovery, device trust, sender/receiver approval,
+background receiver, tray, notifications, onboarding, and packaged installers.
 
 ## License
 
