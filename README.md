@@ -180,9 +180,14 @@ session layer, and transfer pipeline.
 
 ## Status
 
-**Nexo 1.0 (release candidate).** Desktop app feature-complete: encrypted QUIC
-transfers, resume, LAN discovery, device trust, sender/receiver approval,
-background receiver, tray, notifications, onboarding, and packaged installers.
+**Nexo 1.0.** Desktop app feature-complete: encrypted QUIC transfers, resume,
+LAN discovery, device trust, sender/receiver approval, background receiver, tray,
+notifications, onboarding, and packaged installers for Linux and Windows.
+
+**Current limitation:** Nexo 1.0 transfers between devices on the **same local
+network** (LAN). Sending to someone across the internet with a **share link** —
+still direct peer-to-peer, still no cloud storage — is planned for **Nexo 2.0**
+(see the [share-links roadmap](docs/roadmap/nexo-2-share-links.md)).
 
 ## License
 

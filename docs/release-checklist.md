@@ -14,7 +14,7 @@ the release gate; the numbered sections that follow are the exact procedures.
 ### Build validation
 
 - [ ] **Linux AppImage** builds and launches (`Nexo_1.0.0_amd64.AppImage`)
-- [ ] **Linux deb** builds and installs (`Nexo_1.0.0_amd64.deb`)
+- [x] **Linux deb** builds; payload verified (binary + icons + `.desktop`) — install on a clean machine still pending
 - [ ] **Windows MSI** builds and installs (`Nexo_1.0.0_x64_en-US.msi`)
 - [ ] **Windows portable exe** launches by double-click (`Nexo-portable.exe`)
 
@@ -35,19 +35,75 @@ the release gate; the numbered sections that follow are the exact procedures.
 
 ### Reliability
 
-- [ ] **1 GB transfer** completes with matching SHA-256
-- [ ] **5 GB transfer** completes with matching SHA-256 (no idle-timeout, no OOM)
-- [ ] **Interrupted transfer** — kill the sender mid-transfer; checkpoint persists
-- [ ] **Resume** — restart the sender; it resumes and completes (only missing
-      chunks re-sent)
-- [ ] **SHA verification** — the receiver's whole-file SHA-256 gate passes; a
-      corrupted transfer is rejected, not silently written
+- [x] **1 GB transfer** completes with matching SHA-256 _(verified — Linux↔Linux)_
+- [x] **5 GB transfer** completes with matching SHA-256 (no idle-timeout, no OOM)
+      _(verified — 1280/1280 chunks, ~49 s)_
+- [x] **Interrupted transfer** — kill the sender mid-transfer; checkpoint persists
+      _(verified — 1 GB, checkpoint held at 137/256)_
+- [x] **Resume** — restart the sender; it resumes and completes (only missing
+      chunks re-sent) _(verified — re-sent 119 of 256, completed 256/256)_
+- [x] **SHA verification** — the receiver's whole-file SHA-256 gate passes; a
+      corrupted transfer is rejected, not silently written _(verified — every
+      transfer above matched; reject test leaves no file)_
 
-> Automated coverage for the reliability row already exists:
-> `cargo test -p cli` includes real interrupt→resume→verify tests, and
-> `crash_recovery_reliability_report_10x` (run with `--ignored`) reports a 10×
-> interrupt/resume/verify success rate. The 5 GB run is the manual, full-scale
-> confirmation.
+> These were run **Linux ↔ Linux** with the release binary (see "Validation
+> results" below). The **Linux ↔ Windows** cross-platform pass still requires a
+> Windows peer.
+
+---
+
+## Validation results (v1.0.0)
+
+Recorded during the final cross-platform validation phase. **Legend:**
+✅ verified · ⏳ pending operator (needs Windows host / GUI display / second
+machine — could not be run in the Linux dev/CI environment).
+
+### Automated & code quality
+
+- ✅ `cargo clippy --workspace --all-targets -- -D warnings` — clean
+- ✅ `npm run build` (tsc + vite) — clean
+- ✅ `cargo test` — cli 23, desktop 28, storage 17, networking 8, engine 7,
+  crypto 6, common 9 (real-QUIC cli + SQLite storage suites are
+  parallelism-sensitive; pass in isolation / serial / at default parallelism)
+
+### Real transfer testing (Linux ↔ Linux, over QUIC, release build)
+
+| Case | Result | Detail |
+|---|---|---|
+| 1 MB | ✅ SHA-256 match | ~26 MB/s |
+| 100 MB | ✅ SHA-256 match | ~118 MB/s |
+| **5 GB** | ✅ SHA-256 match | 1280/1280 chunks, ~49 s, ~108 MB/s — **no idle timeout** |
+| Resume after interrupt | ✅ SHA-256 match | 1 GB killed at 137/256 chunks → resumed from 137/256, re-sent **only** the missing 119 chunks, completed 256/256 |
+| Sender approval | ✅ | gated send path exercised (`--auto-accept` for automation) |
+| Receiver approval | ✅ | gated receive path exercised (`--auto-accept` for automation) |
+
+- ⏳ **Linux ↔ Windows** transfer — needs a Windows peer; not run here.
+
+### Linux packaging
+
+- ✅ **.deb** builds and payload verified — `Package: nexo`, `Version: 1.0.0`,
+  `Maintainer: Nexo`, correct WebKitGTK/appindicator deps; contains
+  `usr/bin/nexo-desktop`, hicolor icons (32/128), and `Nexo.desktop`
+  (`Name=Nexo`, `Exec=nexo-desktop`, `Terminal=false`).
+- ⏳ **AppImage** — build config ready; not produced in this environment (the
+  sandbox lacks the gdk-pixbuf loader tree linuxdeploy needs). CI builds it.
+- ⏳ **Icon in launcher / tray / autostart / notifications** — GUI behaviors that
+  need a desktop session. Autostart file-writing is unit-tested; tray + OS
+  notifications are wired via standard Tauri APIs but need a live display to see.
+
+### Windows
+
+- ✅ MSI + portable-exe **configuration** verified (see
+  `docs/windows-install-test.md`).
+- ⏳ **MSI install / launch / uninstall**, **portable exe launch**, and
+  **`scripts/windows-check.ps1`** run — all require a Windows machine. Recorded as
+  PENDING in `docs/windows-install-test.md` for an operator to complete.
+
+### Security flow
+
+- ✅ Consent gates on both sides exercised in the transfer tests; certificate
+  trust unchanged. Reject path leaves no output file (covered by
+  `receiver_rejection_cancels_transfer_and_writes_no_file`).
 
 ---
 
