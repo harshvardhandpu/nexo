@@ -16,6 +16,7 @@ the release gate; the numbered sections that follow are the exact procedures.
 - [ ] **Linux AppImage** builds and launches (`Nexo_1.0.0_amd64.AppImage`)
 - [ ] **Linux deb** builds and installs (`Nexo_1.0.0_amd64.deb`)
 - [ ] **Windows MSI** builds and installs (`Nexo_1.0.0_x64_en-US.msi`)
+- [ ] **Windows portable exe** launches by double-click (`Nexo-portable.exe`)
 
 ### Application
 
@@ -103,13 +104,16 @@ Artifacts:
 - [ ] AppImage → `target/release/bundle/appimage/Nexo_1.0.0_amd64.AppImage`
 - [ ] deb → `target/release/bundle/deb/Nexo_1.0.0_amd64.deb`
 
-Windows (on a Windows host with MSVC + WebView2):
+Windows (on a Windows host with MSVC + WebView2 — see
+`docs/windows-development.md`; run `scripts/windows-check.ps1` to verify the
+environment first):
 
-```bash
-npm run tauri build -- --bundles msi
+```powershell
+npm run tauri build          # MSI + raw exe
 ```
 
 - [ ] MSI → `target\release\bundle\msi\Nexo_1.0.0_x64_en-US.msi`
+- [ ] Portable exe → `target\release\nexo-desktop.exe` (ship as `Nexo-portable.exe`)
 
 > **CI note:** `.github/workflows/release.yml` builds all three artifacts on tag /
 > manual dispatch (Linux AppImage+deb on `ubuntu-22.04`, Windows MSI on

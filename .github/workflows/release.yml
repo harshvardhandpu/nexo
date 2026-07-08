@@ -96,14 +96,19 @@ jobs:
         working-directory: apps/desktop
         run: npx tauri build --bundles msi
 
-      - name: Collect artifact
+      - name: Collect artifacts
         shell: bash
         run: |
           mkdir -p dist-artifacts
+          # Installer (recommended for normal users).
           cp target/release/bundle/msi/*.msi dist-artifacts/Nexo-windows.msi || true
+          # Portable single executable (no install; requires WebView2). Tauri
+          # names the raw binary after the Cargo [[bin]] (nexo-desktop); ship it
+          # as Nexo-portable.exe.
+          cp target/release/nexo-desktop.exe dist-artifacts/Nexo-portable.exe || true
           ls -la dist-artifacts
 
-      - name: Upload Windows artifact
+      - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
           name: nexo-windows

@@ -42,6 +42,19 @@ first use, and troubleshooting for a normal Windows 10 / 11 user.
 To confirm the installed version, open **Settings → About** (shows version,
 build type, and commit).
 
+### Portable (no installer)
+
+If you'd rather not install anything, download **`Nexo-portable.exe`** from the
+release, put it wherever you like, and **double-click it** — Nexo launches
+directly. No terminal, no Rust, no Node; it only needs the **WebView2 runtime**
+(see [Requirements](#requirements)). The portable exe doesn't create Start Menu /
+desktop shortcuts, but it's otherwise the same app and stores its data in the
+same place (`%APPDATA%\dev.nexo.desktop`).
+
+> Prefer the **MSI** for everyday use (shortcuts, uninstall entry, automatic
+> WebView2 install). Use the portable exe for a quick try or a locked-down
+> machine where you can't run installers.
+
 ---
 
 ## Using Nexo
@@ -168,9 +181,13 @@ On a Windows machine with the **MSVC** toolchain, **Node ≥ 18**, and **WebView
 ```powershell
 git clone https://github.com/harshvardhandpu/nexo
 cd nexo\apps\desktop
-npm ci
-npm run tauri build            # produces the MSI under
-                               # target\release\bundle\msi\
+npm install
+npm run tauri build            # MSI  -> target\release\bundle\msi\
+                               # exe  -> target\release\nexo-desktop.exe
 ```
+
+For the full developer setup (Git, Rust MSVC, Node, Visual Studio C++ build
+tools) and troubleshooting, see **[docs/windows-development.md](windows-development.md)**.
+Run **`scripts/windows-check.ps1`** first to verify your environment.
 
 See `docs/release-checklist.md` for the full release process.

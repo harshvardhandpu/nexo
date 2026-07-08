@@ -57,7 +57,7 @@ holding your files. This is the first stable release.
 | Platform | Status | Artifact |
 |---|---|---|
 | Linux (x86_64) | ✅ Supported | `Nexo-linux.AppImage`, `Nexo-linux.deb` |
-| Windows 10/11 (x64) | ✅ Supported | `Nexo-windows.msi` |
+| Windows 10/11 (x64) | ✅ Supported | `Nexo-windows.msi`, `Nexo-portable.exe` |
 | macOS | ⏳ Coming later | — |
 
 ## Installation
@@ -75,7 +75,8 @@ sudo apt install ./Nexo-linux.deb
 Full guide: [`docs/linux-install.md`](linux-install.md).
 
 **Windows** — download `Nexo-windows.msi`, run the installer, launch **Nexo**
-from the Start Menu. Full guide: [`docs/windows-install.md`](windows-install.md).
+from the Start Menu. Prefer no install? Grab `Nexo-portable.exe` and
+double-click it. Full guide: [`docs/windows-install.md`](windows-install.md).
 
 **macOS** — coming later.
 

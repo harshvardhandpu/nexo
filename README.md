@@ -86,12 +86,27 @@ Full guide (dependencies, tray, autostart, troubleshooting):
 
 ### Windows
 
-Download **`Nexo-windows.msi`** from the
-[latest release](https://github.com/harshvardhandpu/nexo/releases), run the
-installer, and launch **Nexo** from the Start Menu.
+**Recommended — installer:**
+
+1. Download **`Nexo-windows.msi`** from the
+   [latest release](https://github.com/harshvardhandpu/nexo/releases).
+2. Run the installer. On the *"Windows protected your PC"* prompt (unsigned
+   build), click **More info → Run anyway**.
+3. Finish the install — Nexo adds a Start Menu entry, a desktop shortcut, and an
+   uninstall entry.
+4. Launch **Nexo** from the Start Menu.
+
+**Requirements:** Windows 10 / 11 (64-bit) and the **WebView2 runtime** — already
+present on Windows 11 and current Windows 10. If it's missing, the installer
+downloads and installs it automatically (first install needs internet).
+
+**Portable — no install:** prefer not to install? Download **`Nexo-portable.exe`**
+from the release, double-click it, and Nexo launches. No terminal, no Rust, no
+Node — just WebView2 (above). Your data still lives in `%APPDATA%\dev.nexo.desktop`.
 
 Full guide (firewall, discovery, antivirus, VPN):
 **[docs/windows-install.md](docs/windows-install.md)**.
+Building on Windows: **[docs/windows-development.md](docs/windows-development.md)**.
 
 ### macOS
 
@@ -100,15 +115,21 @@ Full guide (firewall, discovery, antivirus, VPN):
 ### Build from source
 
 Prerequisites: [Rust](https://rustup.rs) (stable), [Node.js](https://nodejs.org)
-≥ 18, and the platform libraries noted in the install guides above.
+≥ 18, and the platform build tools.
 
 ```bash
 git clone https://github.com/harshvardhandpu/nexo
 cd nexo/apps/desktop
-npm ci
+npm install
 npm run tauri dev            # run the app
 npm run tauri build          # build an installer for your platform
 ```
+
+Platform-specific setup:
+- **Linux:** [docs/linux-install.md](docs/linux-install.md#building-from-source)
+- **Windows:** [docs/windows-development.md](docs/windows-development.md) — Git,
+  Rust (MSVC), Node, Visual Studio C++ build tools. Run
+  `scripts/windows-check.ps1` to verify your environment first.
 
 ## How it works
 
@@ -149,6 +170,8 @@ control:
 
 - [Install on Linux](docs/linux-install.md)
 - [Install on Windows](docs/windows-install.md)
+- [Build on Windows (developers)](docs/windows-development.md)
+- [Release notes — v1.0.0](docs/release-notes-v1.0.0.md)
 - [Nexo 2.0 roadmap — global share links](docs/roadmap/nexo-2-share-links.md)
 - [Release checklist](docs/release-checklist.md)
 
