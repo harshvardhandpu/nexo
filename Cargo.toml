@@ -13,3 +13,13 @@ members = [
 
 [workspace.dependencies]
 time = "=0.3.44"
+
+# Release build optimization for distributed binaries. Conservative and
+# behavior-preserving: unwinding panics are kept (tests + resume rely on them),
+# only size/inlining are tuned. Applies workspace-wide without touching any
+# crate's source or logic.
+[profile.release]
+strip = true       # drop debug symbols -> smaller installers
+lto = "thin"       # cross-crate inlining without full-LTO build cost
+codegen-units = 1  # better optimization for the shipped binary
+
