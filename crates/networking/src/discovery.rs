@@ -17,6 +17,16 @@ const VERSION_PROPERTY: &str = "version";
 /// it is advertised by the peer itself, so trust still requires explicit
 /// user confirmation (never granted from discovery alone).
 const FINGERPRINT_PROPERTY: &str = "fingerprint";
+/// TXT property holding the number of certificate chunks (`cert0`..`certN-1`).
+const CERTIFICATE_CHUNKS_PROPERTY: &str = "certn";
+/// Prefix for certificate chunk properties. The peer's DER certificate is
+/// hex-encoded and split across `cert0`, `cert1`, … because a single mDNS TXT
+/// value is capped at 255 bytes (RFC 6763) while a cert is ~700 hex chars.
+/// Publishing the certificate lets a pairing peer store it and later connect
+/// (the QUIC client pins it) without any out-of-band cert exchange.
+const CERTIFICATE_CHUNK_PREFIX: &str = "cert";
+/// Hex chars per certificate chunk. Stays well under the 255-byte TXT limit.
+const CERTIFICATE_CHUNK_LEN: usize = 200;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerAdvertisement {
@@ -26,6 +36,10 @@ pub struct PeerAdvertisement {
     /// Optional certificate fingerprint to publish for pairing. `None` omits the
     /// TXT field (older peers / no identity available).
     pub fingerprint: Option<String>,
+    /// Optional DER certificate to publish for pairing. When present it is
+    /// hex-encoded and chunked across TXT records so a pairing peer can store it
+    /// and later establish a QUIC connection (which pins this exact cert).
+    pub certificate_der: Option<Vec<u8>>,
 }
 
 impl PeerAdvertisement {
@@ -35,12 +49,19 @@ impl PeerAdvertisement {
             display_name: display_name.into(),
             port,
             fingerprint: None,
+            certificate_der: None,
         }
     }
 
     /// Sets the certificate fingerprint advertised for pairing.
     pub fn with_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
         self.fingerprint = Some(fingerprint.into());
+        self
+    }
+
+    /// Sets the DER certificate advertised for pairing.
+    pub fn with_certificate(mut self, certificate_der: impl Into<Vec<u8>>) -> Self {
+        self.certificate_der = Some(certificate_der.into());
         self
     }
 }
@@ -53,6 +74,10 @@ pub struct PeerInfo {
     pub port: u16,
     /// The peer's advertised certificate fingerprint, if it published one.
     pub fingerprint: Option<String>,
+    /// The peer's advertised DER certificate, reassembled from TXT chunks. Used
+    /// by the desktop pairing flow to store a trusted peer's certificate so it
+    /// can later be sent to. `None` when the peer published no certificate.
+    pub certificate_der: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -415,6 +440,20 @@ fn build_service_info_with(
     if let Some(fingerprint) = &advertisement.fingerprint {
         properties.insert(FINGERPRINT_PROPERTY.to_owned(), fingerprint.clone());
     }
+    if let Some(certificate_der) = &advertisement.certificate_der {
+        let hex = hex_encode(certificate_der);
+        let chunks: Vec<&str> = split_chunks(&hex, CERTIFICATE_CHUNK_LEN);
+        properties.insert(
+            CERTIFICATE_CHUNKS_PROPERTY.to_owned(),
+            chunks.len().to_string(),
+        );
+        for (index, chunk) in chunks.iter().enumerate() {
+            properties.insert(
+                format!("{CERTIFICATE_CHUNK_PREFIX}{index}"),
+                (*chunk).to_owned(),
+            );
+        }
+    }
 
     let advertisable: Vec<IpAddr> = addresses
         .iter()
@@ -439,6 +478,64 @@ fn build_service_info_with(
     } else {
         Ok(service)
     }
+}
+
+/// Reassembles a peer's DER certificate from its `certn` + `cert0..certN-1` TXT
+/// chunks. Returns `None` if the peer published no certificate or the chunks are
+/// incomplete/malformed (in which case pairing simply falls back to being
+/// fingerprint-only for that peer).
+fn reassemble_certificate(service: &ResolvedService) -> Option<Vec<u8>> {
+    let count: usize = service
+        .get_property_val_str(CERTIFICATE_CHUNKS_PROPERTY)?
+        .parse()
+        .ok()?;
+    let mut hex = String::new();
+    for index in 0..count {
+        let chunk = service.get_property_val_str(&format!("{CERTIFICATE_CHUNK_PREFIX}{index}"))?;
+        hex.push_str(chunk);
+    }
+    hex_decode(&hex)
+}
+
+/// Splits `text` into `chunk_len`-char slices (the last may be shorter).
+fn split_chunks(text: &str, chunk_len: usize) -> Vec<&str> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let bytes = text.as_bytes();
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < bytes.len() {
+        let end = (start + chunk_len).min(bytes.len());
+        chunks.push(&text[start..end]);
+        start = end;
+    }
+    chunks
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from_digit((byte >> 4) as u32, 16).unwrap());
+        out.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap());
+    }
+    out
+}
+
+fn hex_decode(hex: &str) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = hex.as_bytes();
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let mut index = 0;
+    while index < bytes.len() {
+        let hi = (bytes[index] as char).to_digit(16)?;
+        let lo = (bytes[index + 1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+        index += 2;
+    }
+    Some(out)
 }
 
 /// Non-loopback local addresses suitable for advertising to LAN peers, in
@@ -560,6 +657,8 @@ fn resolved_peer_from_service(service: &ResolvedService) -> Option<ResolvedPeer>
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
 
+    let certificate_der = reassemble_certificate(service);
+
     Some(ResolvedPeer {
         info: PeerInfo {
             peer_id,
@@ -567,6 +666,7 @@ fn resolved_peer_from_service(service: &ResolvedService) -> Option<ResolvedPeer>
             addresses,
             port: service.get_port(),
             fingerprint,
+            certificate_der,
         },
         fullname: service.get_fullname().to_owned(),
     })
@@ -676,6 +776,64 @@ mod tests {
     }
 
     #[test]
+    fn hex_encode_decode_roundtrips_certificate_bytes() {
+        // A realistic cert size (~355 bytes) round-trips through the hex codec
+        // used for TXT chunking.
+        let cert: Vec<u8> = (0..355u16).map(|i| (i % 256) as u8).collect();
+        let hex = hex_encode(&cert);
+        assert_eq!(hex.len(), cert.len() * 2);
+        assert_eq!(hex_decode(&hex), Some(cert));
+        // Malformed hex is rejected, not silently truncated.
+        assert_eq!(hex_decode("abc"), None); // odd length
+        assert_eq!(hex_decode("zz"), None); // non-hex
+    }
+
+    #[test]
+    fn certificate_is_chunked_into_txt_records_within_size_limit() {
+        // ~355-byte cert -> ~710 hex chars -> multiple <=255-byte TXT values.
+        let cert: Vec<u8> = (0..355u16)
+            .map(|i| (i.wrapping_mul(7) % 256) as u8)
+            .collect();
+        let advertisement =
+            PeerAdvertisement::new(PeerId("peer-cert".to_owned()), "archlinux", 50038)
+                .with_certificate(cert.clone());
+        let lan = IpAddr::V4(Ipv4Addr::new(172, 21, 209, 204));
+
+        let service = build_service_info_with(&advertisement, &[lan]).expect("service info");
+
+        let count: usize = service
+            .get_property_val_str(CERTIFICATE_CHUNKS_PROPERTY)
+            .expect("chunk count present")
+            .parse()
+            .expect("numeric count");
+        assert!(count >= 2, "a ~700-char cert should need multiple chunks");
+
+        // Reassemble the way a discovering peer would, and confirm the bytes and
+        // that every chunk fits the TXT value limit.
+        let mut hex = String::new();
+        for index in 0..count {
+            let chunk = service
+                .get_property_val_str(&format!("{CERTIFICATE_CHUNK_PREFIX}{index}"))
+                .expect("chunk present");
+            assert!(chunk.len() <= 255, "TXT value must stay within 255 bytes");
+            hex.push_str(chunk);
+        }
+        assert_eq!(hex_decode(&hex), Some(cert));
+    }
+
+    #[test]
+    fn no_certificate_omits_the_chunk_records() {
+        let advertisement = PeerAdvertisement::new(PeerId("peer-nocert".to_owned()), "host", 2);
+        let lan = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3));
+        let service = build_service_info_with(&advertisement, &[lan]).expect("service info");
+        assert_eq!(
+            service.get_property_val_str(CERTIFICATE_CHUNKS_PROPERTY),
+            None
+        );
+        assert_eq!(service.get_property_val_str("cert0"), None);
+    }
+
+    #[test]
     fn empty_addresses_still_build_a_service() {
         // On a host with no routable address, the service still registers (via
         // addr-auto) rather than failing — localhost only as a last resort.
@@ -782,6 +940,7 @@ mod tests {
             addresses: vec![IpAddr::from([127, 0, 0, 1])],
             port,
             fingerprint: None,
+            certificate_der: None,
         }
     }
 }

@@ -148,6 +148,9 @@ pub struct DiscoveredPeer {
     pub addresses: Vec<String>,
     pub port: u16,
     pub fingerprint: Option<String>,
+    /// The peer's advertised DER certificate, when it published one. Used by the
+    /// desktop pairing flow to store a trusted peer's certificate for sending.
+    pub certificate_der: Option<Vec<u8>>,
 }
 
 impl From<PeerInfo> for DiscoveredPeer {
@@ -162,6 +165,7 @@ impl From<PeerInfo> for DiscoveredPeer {
                 .collect(),
             port: peer.port,
             fingerprint: peer.fingerprint,
+            certificate_der: peer.certificate_der,
         }
     }
 }
@@ -733,6 +737,25 @@ pub fn build_transfer_request(
             format!("file does not exist: {}", file.display()),
         ));
     }
+    build_transfer_request_to_peer(file, address, &address.to_string())
+}
+
+/// Builds a pending transfer request for an explicit `address` and friendly
+/// `display_name`, without consulting the local `receiver.peer` file. Used by
+/// the desktop to send to a *trusted remote* device (whose certificate is held
+/// in the trusted store, not in `receiver.peer`). Only assembles the
+/// confirmation metadata — no bytes move until the request is approved.
+pub fn build_transfer_request_to_peer(
+    file: &Path,
+    address: SocketAddr,
+    display_name: &str,
+) -> CliResult<AirdropRequest> {
+    if !file.is_file() {
+        return Err(io_error(
+            ErrorKind::NotFound,
+            format!("file does not exist: {}", file.display()),
+        ));
+    }
     let file_size = fs::metadata(file)?.len();
     let file_name = file
         .file_name()
@@ -745,7 +768,7 @@ pub fn build_transfer_request(
         file_path: file.to_path_buf(),
         file_name,
         file_size,
-        peer_display_name: address.to_string(),
+        peer_display_name: display_name.to_owned(),
         peer_address: address,
         status: AirdropRequestStatus::Pending,
     })
@@ -841,9 +864,10 @@ pub fn run_send<W: Write>(
     config: &CliConfig,
     output: &mut W,
 ) -> CliResult<()> {
-    fs::create_dir_all(&config.state_dir)?;
-
-    let mut storage = storage(config)?;
+    // Legacy/local path: resolve the receiver certificate from this device's own
+    // `receiver.peer` file. Only works when sending to the address that file
+    // advertises (e.g. loopback self-tests). Desktop sends to a *trusted remote*
+    // device go through `run_send_to_peer` with the peer's stored certificate.
     let advert = load_receiver_advert(config)?;
     let address = host.unwrap_or(advert.address);
     if address != advert.address {
@@ -852,6 +876,39 @@ pub fn run_send<W: Write>(
             format!("no trusted receiver certificate is stored for {address}"),
         ));
     }
+
+    run_send_with_cert(file, address, advert.certificate_der, config, output)
+}
+
+/// Sends `file` to an explicit `address` using a caller-supplied peer
+/// certificate, bypassing the local `receiver.peer` file. This is how the
+/// desktop sends to a *trusted* device: the certificate comes from the trusted
+/// store (captured at pairing from the peer's advertised identity), and the
+/// address is the peer's current (live-discovered) endpoint.
+///
+/// Uses the same unchanged transfer engine and networking API as `run_send`
+/// (`register_peer` + `connect`) — only the source of `(address, certificate)`
+/// differs.
+pub fn run_send_to_peer<W: Write>(
+    file: &Path,
+    address: SocketAddr,
+    certificate_der: Vec<u8>,
+    config: &CliConfig,
+    output: &mut W,
+) -> CliResult<()> {
+    run_send_with_cert(file, address, certificate_der, config, output)
+}
+
+fn run_send_with_cert<W: Write>(
+    file: &Path,
+    address: SocketAddr,
+    certificate_der: Vec<u8>,
+    config: &CliConfig,
+    output: &mut W,
+) -> CliResult<()> {
+    fs::create_dir_all(&config.state_dir)?;
+
+    let mut storage = storage(config)?;
 
     let manifest = generate_manifest(file, config.chunk_size)?;
     let transfer_id = TransferId(format!("transfer-{}", manifest.sha256));
@@ -869,7 +926,7 @@ pub fn run_send<W: Write>(
     let mut session = sender.plan().session.clone();
     let mut provider = QuicTransportProvider::localhost(sender_peer())?;
 
-    provider.register_peer(receiver_peer(), address, advert.certificate_der);
+    provider.register_peer(receiver_peer(), address, certificate_der);
     transition_session(&mut session, SessionState::Connecting)?;
     storage.save_session(&session)?;
     save_latest(config, &transfer_id, &session_id)?;
@@ -1247,7 +1304,11 @@ fn advertise_receiver<W: Write>(
         display_name,
         advert.address.port(),
     )
-    .with_fingerprint(fingerprint);
+    .with_fingerprint(fingerprint)
+    // Publish the receiver's certificate so a pairing peer can store it and
+    // later connect (the QUIC client pins this exact cert). Same public
+    // certificate already written to `receiver.peer`.
+    .with_certificate(advert.certificate_der.clone());
 
     match ServiceAdvertisement::register(advertisement) {
         Ok(handle) => Some(handle),
@@ -1898,6 +1959,7 @@ mod tests {
             addresses: vec!["127.0.0.1".to_owned()],
             port: 43001,
             fingerprint: None,
+            certificate_der: None,
         }];
         let mut output = Vec::new();
 
@@ -2331,6 +2393,72 @@ mod tests {
             2,
             "receiver should have completed two transfers: {receive_output}"
         );
+    }
+
+    #[test]
+    fn send_to_peer_uses_explicit_certificate_without_local_receiver_peer() {
+        // The desktop send path: send using a caller-supplied certificate (as if
+        // from the trusted store) with a sender that has NO local receiver.peer.
+        // Proves sending no longer depends on this device's own receiver.peer —
+        // the root cause of desktop-to-receiver failures.
+        let workspace = TempWorkspace::new("quic-cli-topeer");
+        let source = workspace.path("source.txt");
+        let receive_dir = workspace.path("received");
+        let recv_config = CliConfig {
+            state_dir: workspace.path("recv-state"),
+            receive_dir: receive_dir.clone(),
+            chunk_size: 8,
+        };
+        // Sender uses a separate state dir that never runs `receive`, so it has
+        // no receiver.peer of its own.
+        let send_config = CliConfig {
+            state_dir: workspace.path("send-state"),
+            receive_dir: workspace.path("send-recv"),
+            chunk_size: 8,
+        };
+        fs::create_dir_all(&receive_dir).expect("receive dir");
+        fs::write(&source, b"desktop sends with a trusted certificate").expect("source");
+
+        let receiver_config = recv_config.clone();
+        let receiver = thread::spawn(move || {
+            let mut output = Vec::new();
+            run_receive(&receiver_config, &mut output)?;
+            String::from_utf8(output).map_err(|error| {
+                Box::new(IoError::new(ErrorKind::InvalidData, error))
+                    as Box<dyn Error + Send + Sync>
+            })
+        });
+        wait_for_receiver_advert(&recv_config);
+
+        // The certificate the desktop would have captured at pairing and stored.
+        let advert = load_receiver_advert(&recv_config).expect("receiver advert");
+        // The sender genuinely has no receiver.peer of its own.
+        assert!(
+            load_receiver_advert(&send_config).is_err(),
+            "sender must not rely on a local receiver.peer"
+        );
+
+        let mut send_output = Vec::new();
+        run_send_to_peer(
+            &source,
+            advert.address,
+            advert.certificate_der,
+            &send_config,
+            &mut send_output,
+        )
+        .expect("send to trusted peer");
+
+        let receive_output = receiver.join().expect("receiver thread").expect("output");
+        assert_eq!(
+            fs::read(receive_dir.join("source.txt")).expect("received"),
+            b"desktop sends with a trusted certificate"
+        );
+        assert!(
+            String::from_utf8(send_output)
+                .expect("send utf8")
+                .contains("transfer complete")
+        );
+        assert!(receive_output.contains("completed"));
     }
 
     #[test]

@@ -389,6 +389,10 @@ impl From<&cli::AirdropRequest> for TransferRequestResponse {
 struct PendingTransferRequest {
     file_path: PathBuf,
     host: Option<SocketAddr>,
+    /// When sending to a *trusted* device, the peer's certificate (from the
+    /// trusted store). `Some` routes the send through `run_send_to_peer` using
+    /// this cert; `None` falls back to the local `receiver.peer` path.
+    certificate_der: Option<Vec<u8>>,
     response: TransferRequestResponse,
 }
 
@@ -910,9 +914,25 @@ fn create_transfer_request(
     let path = PathBuf::from(&file_path);
     validate_file_path(&path)?;
     let host = parse_host(host)?;
-    // Reuse the CLI's trust-checked request builder: an untrusted host is
-    // rejected here, before any confirmation is offered or bytes move.
-    let request = build_transfer_request(&path, host, &state.config()).map_err(error_to_string)?;
+
+    // Prefer a *trusted* device: resolve the target's certificate from the
+    // trusted store and its current endpoint from live discovery (so a restarted
+    // receiver on a new port still works). Fall back to the local
+    // `receiver.peer` path only when no trusted device matches (e.g. loopback
+    // self-tests), preserving existing behavior.
+    let (request, certificate_der) = match resolve_trusted_target(&state, host) {
+        Some(target) => {
+            let request =
+                cli::build_transfer_request_to_peer(&path, target.address, &target.display_name)
+                    .map_err(error_to_string)?;
+            (request, Some(target.certificate_der))
+        }
+        None => {
+            let request =
+                build_transfer_request(&path, host, &state.config()).map_err(error_to_string)?;
+            (request, None)
+        }
+    };
     let response = TransferRequestResponse::from(&request);
 
     state
@@ -924,6 +944,7 @@ fn create_transfer_request(
             PendingTransferRequest {
                 file_path: request.file_path,
                 host: Some(request.peer_address),
+                certificate_der,
                 response: response.clone(),
             },
         );
@@ -934,6 +955,91 @@ fn create_transfer_request(
         .map_err(|error| format!("failed to emit transfer request event: {error}"))?;
 
     Ok(response)
+}
+
+/// A resolved send destination for a trusted device: its current endpoint and
+/// the certificate to pin (from the trusted store).
+struct TrustedTarget {
+    address: SocketAddr,
+    certificate_der: Vec<u8>,
+    display_name: String,
+}
+
+/// Resolves a trusted device to send to, given the UI's requested host.
+///
+/// A trusted device's *current* endpoint is found from live discovery by
+/// matching the peer's advertised certificate fingerprint to the stored one —
+/// so a receiver that restarted on a new port is still reachable (fixing the
+/// stale-address problem). The certificate always comes from the trusted store
+/// (the identity the user confirmed), never from the wire at send time.
+///
+/// Returns `None` when no trusted device matches (the caller then falls back to
+/// the local `receiver.peer` path), or when the matched entry predates
+/// certificate storage (empty cert — must be re-paired).
+fn resolve_trusted_target(
+    state: &DesktopAppState,
+    requested_host: Option<SocketAddr>,
+) -> Option<TrustedTarget> {
+    let trusted = state.store.trusted_devices();
+    let live = discover_peers(&state.config()).unwrap_or_default();
+    resolve_trusted_target_from(&trusted, &live, requested_host)
+}
+
+/// Pure resolution logic (no I/O) so it can be tested with synthetic trusted
+/// devices and live peers. See [`resolve_trusted_target`].
+fn resolve_trusted_target_from(
+    trusted: &[store::TrustedDevice],
+    live: &[DiscoveredPeer],
+    requested_host: Option<SocketAddr>,
+) -> Option<TrustedTarget> {
+    if trusted.is_empty() {
+        return None;
+    }
+
+    // The live endpoint of a trusted device, matched by fingerprint (identity),
+    // not by a possibly-stale stored address.
+    let live_endpoint = |device: &store::TrustedDevice| -> Option<SocketAddr> {
+        live.iter().find_map(|peer| {
+            if peer.fingerprint.as_deref() == Some(device.fingerprint.as_str()) {
+                peer.addresses
+                    .first()
+                    .and_then(|ip| format!("{ip}:{}", peer.port).parse().ok())
+            } else {
+                None
+            }
+        })
+    };
+
+    let chosen = match requested_host {
+        // Match the requested host to a trusted device by its live endpoint
+        // first (handles a restarted receiver), then by its stored address.
+        Some(host) => trusted.iter().find(|device| {
+            live_endpoint(device) == Some(host)
+                || device.address.parse::<SocketAddr>().ok() == Some(host)
+        }),
+        // No explicit host: unambiguous only when exactly one device is trusted.
+        None => {
+            if trusted.len() == 1 {
+                trusted.first()
+            } else {
+                None
+            }
+        }
+    }?;
+
+    if chosen.certificate_der.is_empty() {
+        return None; // legacy fingerprint-only entry; re-pair to capture the cert
+    }
+
+    // Prefer the live-discovered address; fall back to the stored one only when
+    // discovery is unavailable.
+    let address = live_endpoint(chosen).or_else(|| chosen.address.parse().ok())?;
+
+    Some(TrustedTarget {
+        address,
+        certificate_der: chosen.certificate_der.clone(),
+        display_name: chosen.display_name.clone(),
+    })
 }
 
 #[tauri::command]
@@ -951,10 +1057,13 @@ fn approve_transfer_request(
             .ok_or_else(|| format!("unknown transfer request: {request_id}"))?
     };
 
-    // User consent obtained: only now delegate to the unchanged run_send.
+    // User consent obtained: now delegate to the transfer engine. A trusted
+    // remote device carries its own certificate (run_send_to_peer); otherwise
+    // the local receiver.peer path (run_send) is used.
     let config = state.config();
     let path = pending.file_path;
     let host = pending.host;
+    let certificate_der = pending.certificate_der;
     let meta = TransferMeta {
         direction: "send",
         filename: pending.response.file_name.clone(),
@@ -973,7 +1082,12 @@ fn approve_transfer_request(
         state.store.clone(),
         config.clone(),
         meta,
-        move |output| run_send(&path, host, &config, output),
+        move |output| match (host, certificate_der) {
+            (Some(address), Some(cert)) => {
+                cli::run_send_to_peer(&path, address, cert, &config, output)
+            }
+            _ => run_send(&path, host, &config, output),
+        },
         None::<fn()>,
     );
 
@@ -1126,6 +1240,7 @@ struct PendingPairing {
     address: String,
     platform: String,
     fingerprint: String,
+    certificate_der: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1183,11 +1298,21 @@ fn stage_pairing(
     peer: DiscoveredPeer,
     ui_address: String,
 ) -> DesktopResult<PairingInfo> {
-    let fingerprint = peer.fingerprint.clone().ok_or_else(|| {
-        "device did not advertise a certificate fingerprint — it may be running an older \
-         version that does not support pairing"
-            .to_owned()
-    })?;
+    // Require the peer's advertised certificate: without it we could store a
+    // fingerprint but never actually connect to send. Compute the fingerprint
+    // *locally* from that certificate rather than trusting the advertised
+    // fingerprint string — the value the user confirms is derived from the exact
+    // cert we will pin when sending.
+    let certificate_der = peer
+        .certificate_der
+        .clone()
+        .filter(|der| !der.is_empty())
+        .ok_or_else(|| {
+            "device did not advertise its certificate — it may be running an older version that \
+         does not support pairing. Update it and rescan."
+                .to_owned()
+        })?;
+    let fingerprint = store::certificate_fingerprint(&certificate_der);
 
     let resolved_address = peer
         .addresses
@@ -1207,6 +1332,7 @@ fn stage_pairing(
         address: resolved_address,
         platform: "unknown".to_owned(),
         fingerprint,
+        certificate_der,
     };
 
     if let Ok(mut pairings) = state.pairings.lock() {
@@ -1261,6 +1387,7 @@ fn confirm_pairing_inner(
         address: pairing.address,
         platform: pairing.platform,
         fingerprint: pairing.fingerprint,
+        certificate_der: pairing.certificate_der,
         first_trusted: 0,
         last_seen: store::unix_now(),
     }))
@@ -2267,6 +2394,7 @@ mod tests {
         PendingTransferRequest {
             file_path: PathBuf::from("/tmp/file.bin"),
             host: Some("127.0.0.1:41000".parse().expect("addr")),
+            certificate_der: None,
             response: TransferRequestResponse {
                 id: id.to_owned(),
                 file_path: "/tmp/file.bin".to_owned(),
@@ -2380,14 +2508,24 @@ mod tests {
         })
     }
 
-    fn discovered(peer_id: &str, name: &str, fingerprint: Option<&str>) -> DiscoveredPeer {
+    /// Builds a discovered peer that advertises `certificate_der` (and the
+    /// fingerprint derived from it, as a real receiver would). `None` models an
+    /// older peer that published no certificate.
+    fn discovered(peer_id: &str, name: &str, certificate_der: Option<&[u8]>) -> DiscoveredPeer {
         DiscoveredPeer {
             peer_id: peer_id.to_owned(),
             display_name: name.to_owned(),
             addresses: vec!["172.21.209.204".to_owned()],
             port: 50038,
-            fingerprint: fingerprint.map(str::to_owned),
+            fingerprint: certificate_der.map(store::certificate_fingerprint),
+            certificate_der: certificate_der.map(<[u8]>::to_vec),
         }
+    }
+
+    /// A distinct fake certificate for a device (content varies by seed so
+    /// different devices get different fingerprints).
+    fn fake_cert(seed: &str) -> Vec<u8> {
+        format!("nexo-fake-cert-{seed}").into_bytes()
     }
 
     #[test]
@@ -2412,16 +2550,19 @@ mod tests {
 
     #[test]
     fn discovered_device_can_start_pairing_without_trusting() {
-        // Staging a discovered device returns its advertised fingerprint for
-        // confirmation but must NOT trust it yet.
+        // Staging a discovered device returns the fingerprint derived from its
+        // advertised certificate for confirmation, but must NOT trust it yet.
         let state = state_with_store("pair-start");
-        let peer = discovered("dev-a", "archlinux", Some("AAAA:BBBB:CCCC:DDDD"));
+        let cert = fake_cert("dev-a");
+        let peer = discovered("dev-a", "archlinux", Some(&cert));
 
         let info =
             stage_pairing(&state, peer, "172.21.209.204:50038".to_owned()).expect("pairing stages");
 
         assert_eq!(info.peer_id, "dev-a");
-        assert_eq!(info.fingerprint, "AAAA:BBBB:CCCC:DDDD");
+        // Fingerprint is computed locally from the received certificate, not the
+        // advertised string.
+        assert_eq!(info.fingerprint, store::certificate_fingerprint(&cert));
         assert_eq!(info.address, "172.21.209.204:50038");
         assert!(!info.already_trusted);
         // Critical: no trust written from starting a pairing.
@@ -2432,21 +2573,22 @@ mod tests {
     }
 
     #[test]
-    fn device_without_fingerprint_cannot_be_paired() {
-        // A peer that does not advertise a fingerprint (older version) cannot be
-        // paired — we refuse rather than trusting on discovery alone.
-        let state = state_with_store("pair-nofp");
+    fn device_without_certificate_cannot_be_paired() {
+        // A peer that does not advertise its certificate (older version) cannot
+        // be paired — without the cert we could never connect to send.
+        let state = state_with_store("pair-nocert");
         let peer = discovered("dev-old", "legacy", None);
         assert!(stage_pairing(&state, peer, "1.2.3.4:5".to_owned()).is_err());
         assert!(state.store.trusted_devices().is_empty());
     }
 
     #[test]
-    fn confirming_pairing_creates_trust_with_fingerprint() {
+    fn confirming_pairing_stores_certificate_and_fingerprint() {
         let state = state_with_store("pair-confirm");
+        let cert = fake_cert("dev-b");
         let info = stage_pairing(
             &state,
-            discovered("dev-b", "workstation", Some("1111:2222:3333:4444")),
+            discovered("dev-b", "workstation", Some(&cert)),
             "172.21.209.204:50038".to_owned(),
         )
         .expect("stage");
@@ -2454,12 +2596,16 @@ mod tests {
         let trusted = confirm_pairing_inner(&state, "dev-b", None).expect("confirm");
         assert_eq!(trusted.id, "dev-b");
         assert_eq!(trusted.fingerprint, info.fingerprint);
+        // The remote certificate is stored so the device can later be sent to.
+        assert_eq!(trusted.certificate_der, cert);
         assert_eq!(trusted.display_name, "workstation");
         assert!(trusted.first_trusted > 0, "first-trusted timestamp is set");
 
+        // Lookup returns the stored certificate.
         let stored = state.store.trusted_devices();
         assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].fingerprint, "1111:2222:3333:4444");
+        assert_eq!(stored[0].certificate_der, cert);
+        assert_eq!(stored[0].fingerprint, store::certificate_fingerprint(&cert));
     }
 
     #[test]
@@ -2467,9 +2613,10 @@ mod tests {
         // Pairing the same device twice must not create a duplicate entry, and
         // must preserve the original first-trusted timestamp.
         let state = state_with_store("pair-dup");
+        let cert = fake_cert("dev-c");
         stage_pairing(
             &state,
-            discovered("dev-c", "laptop", Some("DEAD:BEEF:0000:1111")),
+            discovered("dev-c", "laptop", Some(&cert)),
             "172.21.209.204:50038".to_owned(),
         )
         .unwrap();
@@ -2478,7 +2625,7 @@ mod tests {
         // Pair again, this time renaming.
         stage_pairing(
             &state,
-            discovered("dev-c", "laptop", Some("DEAD:BEEF:0000:1111")),
+            discovered("dev-c", "laptop", Some(&cert)),
             "172.21.209.204:50038".to_owned(),
         )
         .unwrap();
@@ -2491,6 +2638,7 @@ mod tests {
             "first-trusted preserved"
         );
         assert_eq!(second.display_name, "laptop-renamed");
+        assert_eq!(second.certificate_der, cert, "cert preserved on re-pair");
     }
 
     #[test]
@@ -2500,7 +2648,7 @@ mod tests {
         let state = state_with_store("pair-reject");
         stage_pairing(
             &state,
-            discovered("dev-d", "phone", Some("CAFE:CAFE:CAFE:CAFE")),
+            discovered("dev-d", "phone", Some(&fake_cert("dev-d"))),
             "172.21.209.204:50038".to_owned(),
         )
         .unwrap();
@@ -2524,6 +2672,98 @@ mod tests {
         let state = state_with_store("pair-unknown");
         assert!(confirm_pairing_inner(&state, "never-staged", None).is_err());
         assert!(!cancel_pairing_inner(&state, "never-staged"));
+    }
+
+    fn trusted_device_with_cert(
+        id: &str,
+        address: &str,
+        certificate_der: &[u8],
+    ) -> store::TrustedDevice {
+        store::TrustedDevice {
+            id: id.to_owned(),
+            display_name: id.to_owned(),
+            address: address.to_owned(),
+            platform: "linux".to_owned(),
+            fingerprint: store::certificate_fingerprint(certificate_der),
+            certificate_der: certificate_der.to_vec(),
+            first_trusted: 1,
+            last_seen: 1,
+        }
+    }
+
+    fn live_peer(name: &str, ip: &str, port: u16, certificate_der: &[u8]) -> DiscoveredPeer {
+        DiscoveredPeer {
+            peer_id: name.to_owned(),
+            display_name: name.to_owned(),
+            addresses: vec![ip.to_owned()],
+            port,
+            fingerprint: Some(store::certificate_fingerprint(certificate_der)),
+            certificate_der: Some(certificate_der.to_vec()),
+        }
+    }
+
+    #[test]
+    fn send_resolves_trusted_certificate_not_local_receiver_peer() {
+        // The desktop must send using the *trusted device's stored certificate*,
+        // never the local receiver.peer. Given a trusted device and a live peer
+        // at the requested host, resolution returns that device's cert.
+        let cert = fake_cert("cli-receiver");
+        let trusted = vec![trusted_device_with_cert(
+            "dev",
+            "172.21.209.204:33044",
+            &cert,
+        )];
+        let live = vec![live_peer("dev", "172.21.209.204", 33044, &cert)];
+        let host = "172.21.209.204:33044".parse().ok();
+
+        let target = resolve_trusted_target_from(&trusted, &live, host).expect("resolves target");
+        assert_eq!(target.certificate_der, cert);
+        assert_eq!(target.address, "172.21.209.204:33044".parse().unwrap());
+    }
+
+    #[test]
+    fn send_uses_live_address_when_stored_address_is_stale() {
+        // Stored endpoint is stale (:60897) but the receiver restarted on :35263.
+        // Resolution matches by fingerprint and uses the LIVE address.
+        let cert = fake_cert("restarted");
+        let trusted = vec![trusted_device_with_cert(
+            "dev",
+            "172.21.209.204:60897",
+            &cert,
+        )];
+        let live = vec![live_peer("dev", "172.21.209.204", 35263, &cert)];
+
+        // User sends to the current (live) address shown in the Devices screen.
+        let host = "172.21.209.204:35263".parse().ok();
+        let target = resolve_trusted_target_from(&trusted, &live, host).expect("resolves");
+        assert_eq!(
+            target.address,
+            "172.21.209.204:35263".parse().unwrap(),
+            "live address must replace the stale stored one"
+        );
+        assert_eq!(target.certificate_der, cert);
+    }
+
+    #[test]
+    fn send_falls_back_to_stored_address_when_discovery_empty() {
+        // No live peers (discovery unavailable): use the stored address, still
+        // with the stored certificate. Single trusted device, no host given.
+        let cert = fake_cert("offline");
+        let trusted = vec![trusted_device_with_cert("dev", "10.0.0.9:41000", &cert)];
+        let target = resolve_trusted_target_from(&trusted, &[], None).expect("resolves offline");
+        assert_eq!(target.address, "10.0.0.9:41000".parse().unwrap());
+        assert_eq!(target.certificate_der, cert);
+    }
+
+    #[test]
+    fn send_ignores_untrusted_and_certless_devices() {
+        // No trusted devices -> None (caller falls back to local receiver.peer).
+        assert!(resolve_trusted_target_from(&[], &[], None).is_none());
+
+        // A trusted device with no stored cert (legacy entry) is not usable.
+        let mut legacy = trusted_device_with_cert("old", "10.0.0.9:41000", b"x");
+        legacy.certificate_der = Vec::new();
+        assert!(resolve_trusted_target_from(&[legacy], &[], None).is_none());
     }
 
     #[test]
@@ -2580,6 +2820,7 @@ mod tests {
             address: "10.0.0.5:41000".to_owned(),
             platform: "linux".to_owned(),
             fingerprint: "AAAA".to_owned(),
+            certificate_der: b"trusted-cert".to_vec(),
             first_trusted: 1,
             last_seen: 1,
         }

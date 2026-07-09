@@ -99,6 +99,13 @@ pub struct TrustedDevice {
     pub address: String,
     pub platform: String,
     pub fingerprint: String,
+    /// The remote peer's DER certificate, captured at pairing time from its
+    /// mDNS advertisement. Required to *send* to this device (the QUIC client
+    /// pins it). `#[serde(default)]` keeps older trusted-devices.json files
+    /// (which stored only a fingerprint) loadable — such entries have an empty
+    /// cert and must be re-paired before they can be sent to.
+    #[serde(default)]
+    pub certificate_der: Vec<u8>,
     pub first_trusted: u64,
     pub last_seen: u64,
 }
@@ -387,6 +394,7 @@ mod tests {
             address: address.to_owned(),
             platform: "linux".to_owned(),
             fingerprint: certificate_fingerprint(id.as_bytes()),
+            certificate_der: format!("cert-{id}").into_bytes(),
             first_trusted: 0,
             last_seen: 0,
         }

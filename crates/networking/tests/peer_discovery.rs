@@ -36,10 +36,14 @@ fn local_discovery_advertises_discovers_expires_and_lists_multiple_peers() {
         laptop_info.fingerprint.as_deref(),
         Some("AAAA:BBBB:CCCC:DDDD")
     );
+    // The full certificate (chunked across TXT records) must also round-trip so
+    // the desktop can store it and later connect to this peer.
+    assert_eq!(laptop_info.certificate_der, Some(sample_certificate()));
     assert_eq!(desktop_info.display_name, "Desktop-PC");
     assert_eq!(desktop_info.port, 41002);
     // A peer that advertises no fingerprint resolves with `None`.
     assert_eq!(desktop_info.fingerprint, None);
+    assert_eq!(desktop_info.certificate_der, None);
 
     let visible = observer.peers();
     assert!(visible.iter().any(|peer| peer.peer_id == laptop_id));
@@ -86,6 +90,14 @@ fn provider(peer_id: PeerId, display_name: &str, port: u16) -> LocalDiscoveryPro
     provider_with_timeout(peer_id, display_name, port, Duration::from_secs(10))
 }
 
+/// A ~355-byte stand-in for a DER certificate, large enough to force multi-chunk
+/// TXT encoding (exercising the reassembly path over real mDNS).
+fn sample_certificate() -> Vec<u8> {
+    (0..355u16)
+        .map(|i| (i.wrapping_mul(13) % 256) as u8)
+        .collect()
+}
+
 fn provider_with_fingerprint(
     peer_id: PeerId,
     display_name: &str,
@@ -93,7 +105,9 @@ fn provider_with_fingerprint(
     fingerprint: &str,
 ) -> LocalDiscoveryProvider {
     LocalDiscoveryProvider::with_peer_timeout(
-        PeerAdvertisement::new(peer_id, display_name, port).with_fingerprint(fingerprint),
+        PeerAdvertisement::new(peer_id, display_name, port)
+            .with_fingerprint(fingerprint)
+            .with_certificate(sample_certificate()),
         Duration::from_secs(10),
     )
     .expect("local discovery provider")
