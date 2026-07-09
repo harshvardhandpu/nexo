@@ -740,6 +740,7 @@ fn spawn_receive_job(app: &tauri::AppHandle, state: &DesktopAppState) -> Desktop
     // it waits.
     let incoming = state.incoming.clone();
     let app = app.clone();
+    let rearm_app = app.clone();
     let approver = move |request: &IncomingTransferRequest| -> bool {
         if auto_accept {
             let _ = app.emit(
@@ -772,6 +773,23 @@ fn spawn_receive_job(app: &tauri::AppHandle, state: &DesktopAppState) -> Desktop
         accepted
     };
 
+    // Re-arm: when this receive job finishes (one transfer, or an error), start
+    // the next receiver so the device stays ready for successive transfers
+    // instead of going deaf after the first file. Only re-arms while background
+    // receiving is enabled, and re-uses the stable port so the advertised
+    // address is unchanged. The one-at-a-time guard at the top of this function
+    // prevents duplicate listeners if a manual "Receive" overlaps.
+    let on_finish = move || {
+        let state = rearm_app.state::<DesktopAppState>();
+        if state.store.background_settings().background_receiving {
+            // Brief pause: lets the finished listener release its UDP socket
+            // before the next one binds the same stable port, and bounds the
+            // re-arm rate if binding ever fails repeatedly.
+            thread::sleep(std::time::Duration::from_millis(200));
+            let _ = spawn_receive_job(&rearm_app, &state);
+        }
+    };
+
     spawn_transfer_job(
         state.jobs.clone(),
         job_id,
@@ -784,6 +802,7 @@ fn spawn_receive_job(app: &tauri::AppHandle, state: &DesktopAppState) -> Desktop
             peer: "incoming".to_owned(),
         },
         move |output| run_receive_gated_with(&config, output, options, approver),
+        Some(on_finish),
     );
 
     Ok(job_id)
@@ -955,6 +974,7 @@ fn approve_transfer_request(
         config.clone(),
         meta,
         move |output| run_send(&path, host, &config, output),
+        None::<fn()>,
     );
 
     Ok(StartJobResponse { job_id })
@@ -1875,7 +1895,7 @@ pub fn run() {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_transfer_job<F>(
+fn spawn_transfer_job<F, G>(
     jobs: Arc<Mutex<HashMap<u64, TransferJob>>>,
     job_id: u64,
     kind: TransferJobKind,
@@ -1883,8 +1903,10 @@ fn spawn_transfer_job<F>(
     config: CliConfig,
     meta: TransferMeta,
     work: F,
+    on_finish: Option<G>,
 ) where
     F: FnOnce(&mut JobOutput) -> cli::CliResult<()> + Send + 'static,
+    G: FnOnce() + Send + 'static,
 {
     thread::spawn(move || {
         let started = std::time::Instant::now();
@@ -1930,6 +1952,14 @@ fn spawn_transfer_job<F>(
                     error,
                 },
             );
+        }
+
+        // Re-arm hook: for the receive job this re-spawns the receiver so the
+        // device keeps accepting successive transfers instead of going deaf
+        // after one file. Runs after the job's final state + history are
+        // recorded, so each received file still yields its own history entry.
+        if let Some(on_finish) = on_finish {
+            on_finish();
         }
     });
 }

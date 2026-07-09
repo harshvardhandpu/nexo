@@ -11,9 +11,9 @@ use engine::pipeline::{
     TransferPipelineReceiver, TransferPipelineSender, reconcile_checkpoint, transition_session,
 };
 use networking::{
-    LocalDiscoveryProvider, PeerAdvertisement, PeerDiscovery, PeerInfo, QuicServerIdentity,
-    QuicTransportProvider, ServiceAdvertisement, TransportConnection, TransportListener,
-    TransportProvider, TransportStream,
+    LocalDiscoveryProvider, PeerAdvertisement, PeerDiscovery, PeerInfo, QuicListener,
+    QuicServerIdentity, QuicTransportProvider, ServiceAdvertisement, TransportConnection,
+    TransportListener, TransportProvider, TransportStream,
 };
 use rand_core::{OsRng, RngCore};
 use std::collections::HashSet;
@@ -352,18 +352,36 @@ pub fn run_receive<W: Write>(config: &CliConfig, output: &mut W) -> CliResult<()
 
 /// CLI `receive`: requires an interactive "Accept incoming file?" confirmation
 /// by default; `--auto-accept` pre-approves for scripting/testing.
+///
+/// The receiver stays ready across successive transfers — it serves one file,
+/// then loops back to accept the next connection, until the process is
+/// interrupted (Ctrl-C). Previously it exited after a single transfer, so a
+/// second `send` to the same receiver (and desktop stress runs) failed with
+/// "connection lost".
 fn run_receive_command<W: Write>(
     config: &CliConfig,
     output: &mut W,
     auto_accept: bool,
 ) -> CliResult<()> {
     if auto_accept {
-        run_receive_gated(config, output, |request| {
-            println!("auto-accept: accepting incoming {}", request.filename);
-            true
-        })
+        run_receive_loop(
+            config,
+            output,
+            ReceiveOptions::default(),
+            |request| {
+                println!("auto-accept: accepting incoming {}", request.filename);
+                true
+            },
+            || true,
+        )
     } else {
-        run_receive_gated(config, output, confirm_incoming_on_terminal)
+        run_receive_loop(
+            config,
+            output,
+            ReceiveOptions::default(),
+            confirm_incoming_on_terminal,
+            || true,
+        )
     }
 }
 
@@ -427,14 +445,86 @@ where
     W: Write,
     F: FnOnce(&IncomingTransferRequest) -> bool,
 {
+    let mut bound = bind_receiver(config, output, options)?;
+    serve_one_transfer(
+        config,
+        &mut bound.storage,
+        &mut bound.listener,
+        output,
+        approve,
+    )
+}
+
+/// Continuously serves incoming transfers on a single bound listener until
+/// `should_continue` returns false. This keeps a device "ready to receive" for
+/// successive transfers instead of exiting after the first file — the behavior
+/// the CLI `receive` command and the desktop background receiver need.
+///
+/// The one-time setup (bind, identity, mDNS advertisement) happens once; then
+/// each iteration accepts one connection and runs a full transfer. A failure in
+/// an individual transfer (a peer dropping mid-stream, a rejected file) is
+/// reported and the loop continues to the next connection — one bad transfer
+/// must never tear down the receiver. Only a fatal setup error aborts.
+pub fn run_receive_loop<W, F, C>(
+    config: &CliConfig,
+    output: &mut W,
+    options: ReceiveOptions,
+    mut approve: F,
+    mut should_continue: C,
+) -> CliResult<()>
+where
+    W: Write,
+    F: FnMut(&IncomingTransferRequest) -> bool,
+    C: FnMut() -> bool,
+{
+    let mut bound = bind_receiver(config, output, options)?;
+
+    while should_continue() {
+        // `&mut approve` is `FnOnce` for this single call while remaining
+        // reusable across iterations.
+        match serve_one_transfer(
+            config,
+            &mut bound.storage,
+            &mut bound.listener,
+            output,
+            &mut approve,
+        ) {
+            Ok(()) => {}
+            Err(error) => {
+                writeln!(output, "transfer error (receiver still listening): {error}")?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// A bound, advertising receiver: the storage handle, the accepting QUIC
+/// listener, and the mDNS advertisement guard (held for as long as the receiver
+/// runs; unregisters on drop).
+struct BoundReceiver {
+    storage: PersistentStorage<SqliteStorageBackend>,
+    listener: QuicListener,
+    _discovery: Option<ServiceAdvertisement>,
+}
+
+/// One-time receiver setup shared by [`run_receive_gated_with`] (single transfer)
+/// and [`run_receive_loop`] (continuous): binds the listener on the stable port,
+/// persists identity/advert, prints "receiving on …", and starts the mDNS
+/// advertisement. No connection is accepted here.
+fn bind_receiver<W: Write>(
+    config: &CliConfig,
+    output: &mut W,
+    options: ReceiveOptions,
+) -> CliResult<BoundReceiver> {
     fs::create_dir_all(&config.state_dir)?;
     fs::create_dir_all(&config.receive_dir)?;
 
-    let mut storage = storage(config)?;
+    let storage = storage(config)?;
     let (identity, stable_port) = load_or_create_receiver_identity(config)?;
     let bind_addr = receiver_bind_addr(stable_port);
     let mut provider = QuicTransportProvider::new(receiver_peer(), bind_addr)?;
-    let mut listener = provider.listen_with_identity(&identity)?;
+    let listener = provider.listen_with_identity(&identity)?;
     if stable_port.is_none() {
         save_receiver_identity(config, &identity, listener.local_addr().port())?;
     }
@@ -463,6 +553,30 @@ where
         None
     };
 
+    Ok(BoundReceiver {
+        storage,
+        listener,
+        _discovery,
+    })
+}
+
+/// Serves exactly one incoming transfer on an already-bound listener: accepts a
+/// connection, runs the approval gate, and (if accepted) receives + verifies the
+/// file. Extracted from [`run_receive_gated_with`] so a long-running receiver
+/// can serve successive transfers on the same listener without re-binding or
+/// re-advertising — the one-time setup (bind, identity, mDNS advert) stays with
+/// the caller.
+fn serve_one_transfer<W, F>(
+    config: &CliConfig,
+    storage: &mut PersistentStorage<SqliteStorageBackend>,
+    listener: &mut QuicListener,
+    output: &mut W,
+    approve: F,
+) -> CliResult<()>
+where
+    W: Write,
+    F: FnOnce(&IncomingTransferRequest) -> bool,
+{
     let mut connection = listener.accept()?;
     let mut stream = connection.accept_stream()?;
     let request_envelope = stream.receive_message()?;
@@ -492,7 +606,7 @@ where
     writeln!(output, "accepted incoming transfer: {}", incoming.filename)?;
 
     let output_path = config.receive_dir.join(&request.manifest.name);
-    let mut checkpoint = load_receive_checkpoint(&storage, &request, &metadata, &output_path)?;
+    let mut checkpoint = load_receive_checkpoint(storage, &request, &metadata, &output_path)?;
 
     if checkpoint.completed_chunks.is_empty() {
         File::create(&output_path)?;
@@ -515,7 +629,7 @@ where
     let acceptance = receiver.accept_transfer(request_envelope, &metadata)?;
     storage.save_session(receiver.session())?;
     storage.save_checkpoint(&checkpoint)?;
-    save_resume_state(&mut storage, &request, checkpoint.clone())?;
+    save_resume_state(storage, &request, checkpoint.clone())?;
     save_latest(config, &request.transfer_id, &request.session_id)?;
     stream.send_message(acceptance)?;
 
@@ -2130,6 +2244,93 @@ mod tests {
         let status = String::from_utf8(status).expect("status utf8");
         assert!(status.contains("State: Completed"));
         assert!(status.contains("Chunks: 5/5"));
+    }
+
+    #[test]
+    fn receiver_serves_successive_transfers_on_one_listener() {
+        // Regression: the receiver used to exit after a single transfer, so a
+        // second `send` to the same receiver (and desktop stress runs) failed
+        // with "connection lost". `run_receive_loop` keeps one bound listener
+        // serving successive transfers. Here it serves two, then stops.
+        let workspace = TempWorkspace::new("quic-cli-successive");
+        let source_a = workspace.path("a.txt");
+        let source_b = workspace.path("b.txt");
+        let receive_dir = workspace.path("received");
+        let state_dir = workspace.path("state");
+        fs::create_dir_all(&receive_dir).expect("receive dir");
+        fs::write(&source_a, b"first transfer payload").expect("source a");
+        fs::write(&source_b, b"second transfer payload, different").expect("source b");
+        let config = CliConfig {
+            state_dir,
+            receive_dir: receive_dir.clone(),
+            chunk_size: 8,
+        };
+        let receive_config = config.clone();
+
+        // Receiver serves exactly two transfers, then `should_continue` returns
+        // false so the loop ends and the thread joins (keeps the test bounded).
+        let receiver = thread::spawn(move || {
+            let mut output = Vec::new();
+            let mut served = 0u32;
+            run_receive_loop(
+                &receive_config,
+                &mut output,
+                ReceiveOptions::default(),
+                |_request| true,
+                || {
+                    // Continue while fewer than two transfers have completed.
+                    // Checked before each accept; after two it returns false.
+                    let go = served < 2;
+                    served += 1;
+                    go
+                },
+            )?;
+            String::from_utf8(output).map_err(|error| {
+                Box::new(IoError::new(ErrorKind::InvalidData, error))
+                    as Box<dyn Error + Send + Sync>
+            })
+        });
+
+        wait_for_receiver_advert(&config);
+        let advert = load_receiver_advert(&config).expect("receiver advert");
+
+        // First transfer.
+        let mut out_a = Vec::new();
+        run_send_gated(&source_a, Some(advert.address), true, &config, &mut out_a).expect("send a");
+        assert!(
+            String::from_utf8(out_a)
+                .unwrap()
+                .contains("transfer complete"),
+            "first transfer should complete"
+        );
+        // The received file from the first transfer is present.
+        assert_eq!(
+            fs::read(receive_dir.join("a.txt")).expect("received a"),
+            b"first transfer payload"
+        );
+
+        // Second transfer to the SAME still-alive receiver — this is what used
+        // to fail with "connection lost".
+        let mut out_b = Vec::new();
+        run_send_gated(&source_b, Some(advert.address), true, &config, &mut out_b).expect("send b");
+        assert!(
+            String::from_utf8(out_b)
+                .unwrap()
+                .contains("transfer complete"),
+            "second transfer should complete on the same receiver"
+        );
+        assert_eq!(
+            fs::read(receive_dir.join("b.txt")).expect("received b"),
+            b"second transfer payload, different"
+        );
+
+        let receive_output = receiver.join().expect("receiver thread").expect("output");
+        // Both transfers were accepted and completed by the one receiver.
+        assert_eq!(
+            receive_output.matches("completed").count(),
+            2,
+            "receiver should have completed two transfers: {receive_output}"
+        );
     }
 
     #[test]

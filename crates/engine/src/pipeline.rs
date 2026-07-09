@@ -1,5 +1,6 @@
 use crate::chunker::{
-    chunk_file, generate_manifest, missing_chunks, read_chunk, sha256_file, verify_chunk,
+    chunk_file, generate_manifest, missing_chunks, read_chunk, sha256_file, sha256_hex,
+    verify_chunk,
 };
 use common::{
     Checkpoint, Chunk, ChunkId, ChunkMetadata, FileManifest, MessageEnvelope, MissingChunks,
@@ -24,6 +25,16 @@ pub enum TransferPipelineError {
     },
     ChunkNotFound(ChunkId),
     ChunkVerificationFailed(ChunkId),
+    /// Sender-side: a chunk read from the source at send time no longer matches
+    /// the hash computed when the transfer was prepared — i.e. the source file
+    /// was modified (or truncated) while the transfer was in progress. Distinct
+    /// from [`ChunkVerificationFailed`], which is a receiver-side integrity
+    /// failure on decrypted data.
+    SourceChunkModified {
+        chunk_id: ChunkId,
+        expected_sha256: String,
+        actual_sha256: String,
+    },
     FileVerificationFailed {
         expected: String,
         actual: String,
@@ -44,6 +55,18 @@ impl std::fmt::Display for TransferPipelineError {
             }
             TransferPipelineError::ChunkVerificationFailed(chunk_id) => {
                 write!(formatter, "chunk verification failed: {}", chunk_id.0)
+            }
+            TransferPipelineError::SourceChunkModified {
+                chunk_id,
+                expected_sha256,
+                actual_sha256,
+            } => {
+                write!(
+                    formatter,
+                    "source file changed during transfer at chunk {}: expected sha256 {}, \
+                     read {} — do not modify the file while sending",
+                    chunk_id.0, expected_sha256, actual_sha256
+                )
             }
             TransferPipelineError::FileVerificationFailed { expected, actual } => {
                 write!(
@@ -232,9 +255,11 @@ impl TransferPipelineSender {
             .ok_or_else(|| TransferPipelineError::ChunkNotFound(chunk_id.clone()))?;
         let plaintext = read_chunk(&self.source_path, metadata)?;
         if !verify_chunk(&plaintext, metadata) {
-            return Err(TransferPipelineError::ChunkVerificationFailed(
-                metadata.id.clone(),
-            ));
+            return Err(TransferPipelineError::SourceChunkModified {
+                chunk_id: metadata.id.clone(),
+                expected_sha256: metadata.sha256.clone(),
+                actual_sha256: sha256_hex(&plaintext.data),
+            });
         }
 
         let encrypted = cipher.encrypt_chunk(&metadata.id, &plaintext.data)?;

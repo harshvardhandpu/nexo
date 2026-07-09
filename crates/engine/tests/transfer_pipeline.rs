@@ -125,6 +125,52 @@ fn sender_transfers_file_to_receiver_and_marks_complete() {
 }
 
 #[test]
+fn sender_detects_source_modified_during_transfer() {
+    // If the source file changes between prepare (manifest) and building a chunk
+    // envelope, the sender must refuse with an actionable SourceChunkModified
+    // error naming the chunk and both hashes — not the cryptic, receiver-flavored
+    // "chunk verification failed". This is the sender-local integrity guard.
+    let workspace = TempWorkspace::new("source-modified");
+    let source = workspace.path("source.bin");
+    write_file(&source, b"original contents for chunk zero and beyond");
+
+    let cipher = session_cipher();
+    let sender = TransferPipelineSender::prepare(&source, config(8)).expect("sender pipeline");
+
+    // Mutate the source after the plan/manifest was captured.
+    write_file(&source, b"TAMPERED contents for chunk zero and beyond!!");
+
+    let error = sender
+        .chunk_envelope(&ChunkId(0), &cipher)
+        .expect_err("modified source must fail chunk build");
+
+    match error {
+        TransferPipelineError::SourceChunkModified {
+            chunk_id,
+            expected_sha256,
+            actual_sha256,
+        } => {
+            assert_eq!(chunk_id, ChunkId(0));
+            assert_ne!(
+                expected_sha256, actual_sha256,
+                "hashes must differ when the source changed"
+            );
+        }
+        other => panic!("expected SourceChunkModified, got {other:?}"),
+    }
+
+    // And the message is actionable (mentions the file changing).
+    let message = sender
+        .chunk_envelope(&ChunkId(0), &cipher)
+        .expect_err("still fails")
+        .to_string();
+    assert!(
+        message.contains("source file changed during transfer"),
+        "unexpected message: {message}"
+    );
+}
+
+#[test]
 fn interrupted_transfer_resumes_from_checkpoint() {
     let workspace = TempWorkspace::new("resume-transfer");
     let source = workspace.path("source.bin");
