@@ -12,12 +12,20 @@ const DISCOVERY_VERSION: &str = "1";
 const PEER_ID_PROPERTY: &str = "peer_id";
 const DISPLAY_NAME_PROPERTY: &str = "display_name";
 const VERSION_PROPERTY: &str = "version";
+/// TXT property carrying the SHA-256 fingerprint of the peer's QUIC certificate.
+/// Used by the desktop pairing flow to show the user a verifiable fingerprint;
+/// it is advertised by the peer itself, so trust still requires explicit
+/// user confirmation (never granted from discovery alone).
+const FINGERPRINT_PROPERTY: &str = "fingerprint";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerAdvertisement {
     pub peer_id: PeerId,
     pub display_name: String,
     pub port: u16,
+    /// Optional certificate fingerprint to publish for pairing. `None` omits the
+    /// TXT field (older peers / no identity available).
+    pub fingerprint: Option<String>,
 }
 
 impl PeerAdvertisement {
@@ -26,7 +34,14 @@ impl PeerAdvertisement {
             peer_id,
             display_name: display_name.into(),
             port,
+            fingerprint: None,
         }
+    }
+
+    /// Sets the certificate fingerprint advertised for pairing.
+    pub fn with_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
+        self.fingerprint = Some(fingerprint.into());
+        self
     }
 }
 
@@ -36,6 +51,8 @@ pub struct PeerInfo {
     pub display_name: String,
     pub addresses: Vec<IpAddr>,
     pub port: u16,
+    /// The peer's advertised certificate fingerprint, if it published one.
+    pub fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -394,6 +411,10 @@ fn build_service_info_with(
         ),
         (VERSION_PROPERTY.to_owned(), DISCOVERY_VERSION.to_owned()),
     ]);
+    let mut properties = properties;
+    if let Some(fingerprint) = &advertisement.fingerprint {
+        properties.insert(FINGERPRINT_PROPERTY.to_owned(), fingerprint.clone());
+    }
 
     let advertisable: Vec<IpAddr> = addresses
         .iter()
@@ -534,12 +555,18 @@ fn resolved_peer_from_service(service: &ResolvedService) -> Option<ResolvedPeer>
         return None;
     }
 
+    let fingerprint = service
+        .get_property_val_str(FINGERPRINT_PROPERTY)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+
     Some(ResolvedPeer {
         info: PeerInfo {
             peer_id,
             display_name,
             addresses,
             port: service.get_port(),
+            fingerprint,
         },
         fullname: service.get_fullname().to_owned(),
     })
@@ -621,6 +648,31 @@ mod tests {
         assert!(!is_advertisable_address(IpAddr::V6(
             "fe80::1".parse().unwrap()
         )));
+    }
+
+    #[test]
+    fn advertised_fingerprint_is_published_in_txt() {
+        // The certificate fingerprint a peer advertises for pairing must be
+        // carried in the service's TXT record so a discovering peer can read it.
+        let advertisement =
+            PeerAdvertisement::new(PeerId("peer-fp".to_owned()), "archlinux", 50038)
+                .with_fingerprint("AAAA:BBBB:CCCC:DDDD");
+        let lan = IpAddr::V4(Ipv4Addr::new(172, 21, 209, 204));
+
+        let service = build_service_info_with(&advertisement, &[lan]).expect("service info");
+
+        assert_eq!(
+            service.get_property_val_str(FINGERPRINT_PROPERTY),
+            Some("AAAA:BBBB:CCCC:DDDD")
+        );
+    }
+
+    #[test]
+    fn no_fingerprint_omits_the_txt_field() {
+        let advertisement = PeerAdvertisement::new(PeerId("peer-nofp".to_owned()), "host", 1);
+        let lan = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let service = build_service_info_with(&advertisement, &[lan]).expect("service info");
+        assert_eq!(service.get_property_val_str(FINGERPRINT_PROPERTY), None);
     }
 
     #[test]
@@ -729,6 +781,7 @@ mod tests {
             display_name: name.to_owned(),
             addresses: vec![IpAddr::from([127, 0, 0, 1])],
             port,
+            fingerprint: None,
         }
     }
 }

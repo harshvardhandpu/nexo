@@ -15,7 +15,12 @@ fn local_discovery_advertises_discovers_expires_and_lists_multiple_peers() {
     let laptop_id = PeerId(format!("laptop-{run_id}"));
     let desktop_id = PeerId(format!("desktop-{run_id}"));
 
-    let mut laptop = provider(laptop_id.clone(), "Harsh-Laptop", 41001);
+    let mut laptop = provider_with_fingerprint(
+        laptop_id.clone(),
+        "Harsh-Laptop",
+        41001,
+        "AAAA:BBBB:CCCC:DDDD",
+    );
     let mut desktop = provider(desktop_id.clone(), "Desktop-PC", 41002);
     let mut observer = provider(observer_id, "Observer", 41000);
 
@@ -25,8 +30,16 @@ fn local_discovery_advertises_discovers_expires_and_lists_multiple_peers() {
     assert_eq!(laptop_info.display_name, "Harsh-Laptop");
     assert_eq!(laptop_info.port, 41001);
     assert!(!laptop_info.addresses.is_empty());
+    // The certificate fingerprint advertised for pairing must round-trip over
+    // real mDNS so the desktop pairing flow can read it.
+    assert_eq!(
+        laptop_info.fingerprint.as_deref(),
+        Some("AAAA:BBBB:CCCC:DDDD")
+    );
     assert_eq!(desktop_info.display_name, "Desktop-PC");
     assert_eq!(desktop_info.port, 41002);
+    // A peer that advertises no fingerprint resolves with `None`.
+    assert_eq!(desktop_info.fingerprint, None);
 
     let visible = observer.peers();
     assert!(visible.iter().any(|peer| peer.peer_id == laptop_id));
@@ -71,6 +84,19 @@ fn local_discovery_advertises_discovers_expires_and_lists_multiple_peers() {
 
 fn provider(peer_id: PeerId, display_name: &str, port: u16) -> LocalDiscoveryProvider {
     provider_with_timeout(peer_id, display_name, port, Duration::from_secs(10))
+}
+
+fn provider_with_fingerprint(
+    peer_id: PeerId,
+    display_name: &str,
+    port: u16,
+    fingerprint: &str,
+) -> LocalDiscoveryProvider {
+    LocalDiscoveryProvider::with_peer_timeout(
+        PeerAdvertisement::new(peer_id, display_name, port).with_fingerprint(fingerprint),
+        Duration::from_secs(10),
+    )
+    .expect("local discovery provider")
 }
 
 fn provider_with_timeout(

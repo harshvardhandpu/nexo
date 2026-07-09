@@ -147,6 +147,7 @@ pub struct DiscoveredPeer {
     pub display_name: String,
     pub addresses: Vec<String>,
     pub port: u16,
+    pub fingerprint: Option<String>,
 }
 
 impl From<PeerInfo> for DiscoveredPeer {
@@ -160,6 +161,7 @@ impl From<PeerInfo> for DiscoveredPeer {
                 .map(|address| address.to_string())
                 .collect(),
             port: peer.port,
+            fingerprint: peer.fingerprint,
         }
     }
 }
@@ -1079,6 +1081,24 @@ fn receiver_discovery_peer_id(device_peer_id: &PeerId) -> PeerId {
     PeerId(format!("{}-recv", device_peer_id.0))
 }
 
+/// Grouped uppercase SHA-256 fingerprint of a certificate, advertised over mDNS
+/// for pairing. Must match the desktop `certificate_fingerprint` format so the
+/// value a pairing peer sees equals the one stored on trust.
+pub fn certificate_fingerprint(certificate_der: &[u8]) -> String {
+    let digest = engine::chunker::sha256_hex(certificate_der).to_uppercase();
+    digest
+        .as_bytes()
+        .chunks(4)
+        .take(8)
+        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+fn advertised_fingerprint(certificate_der: &[u8]) -> String {
+    certificate_fingerprint(certificate_der)
+}
+
 /// Best-effort registration of this receiver on the local mDNS discovery layer.
 ///
 /// Returns the live advertisement handle (kept for the receive session) or
@@ -1104,11 +1124,16 @@ fn advertise_receiver<W: Write>(
         }
     };
     let display_name = local_display_name(&peer_id).unwrap_or_else(|_| "Nexo".to_owned());
+    // Publish the receiver's certificate fingerprint so a pairing peer can show
+    // the user a verifiable fingerprint. Format matches the desktop's
+    // `certificate_fingerprint` (grouped uppercase SHA-256 hex).
+    let fingerprint = advertised_fingerprint(&advert.certificate_der);
     let advertisement = PeerAdvertisement::new(
         receiver_discovery_peer_id(&peer_id),
         display_name,
         advert.address.port(),
-    );
+    )
+    .with_fingerprint(fingerprint);
 
     match ServiceAdvertisement::register(advertisement) {
         Ok(handle) => Some(handle),
@@ -1758,6 +1783,7 @@ mod tests {
             display_name: "Harsh-Laptop".to_owned(),
             addresses: vec!["127.0.0.1".to_owned()],
             port: 43001,
+            fingerprint: None,
         }];
         let mut output = Vec::new();
 

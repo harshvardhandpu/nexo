@@ -38,6 +38,10 @@ pub struct DesktopAppState {
     incoming: Arc<Mutex<HashMap<String, PendingIncoming>>>,
     store: Arc<store::AppStore>,
     presence: Arc<Mutex<HashMap<String, PeerPresence>>>,
+    /// In-flight device pairings awaiting user confirmation, keyed by peer id.
+    /// A pairing is only turned into a trusted device after the user confirms
+    /// the fingerprint (`confirm_pairing`), so discovery alone never grants trust.
+    pairings: Arc<Mutex<HashMap<String, PendingPairing>>>,
 }
 
 impl DesktopAppState {
@@ -53,6 +57,7 @@ impl DesktopAppState {
             incoming: Arc::new(Mutex::new(HashMap::new())),
             store,
             presence: Arc::new(Mutex::new(HashMap::new())),
+            pairings: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -206,6 +211,7 @@ pub struct PeerResponse {
     pub display_name: String,
     pub addresses: Vec<String>,
     pub port: u16,
+    pub fingerprint: Option<String>,
 }
 
 impl From<DiscoveredPeer> for PeerResponse {
@@ -215,6 +221,7 @@ impl From<DiscoveredPeer> for PeerResponse {
             display_name: peer.display_name,
             addresses: peer.addresses,
             port: peer.port,
+            fingerprint: peer.fingerprint,
         }
     }
 }
@@ -1089,40 +1096,183 @@ fn list_trusted_devices(
     Ok(state.store.trusted_devices())
 }
 
-/// Trusts a device by recording UI metadata over its *existing* certificate.
-/// We can only fingerprint a device whose certificate we already hold (the
-/// `receiver.peer` anchor), so trust cannot be fabricated for an unknown peer.
-#[tauri::command]
-fn trust_device(
-    id: String,
+/// A pairing in progress: the verified identity a discovered device advertised,
+/// held until the user confirms the fingerprint. Nothing is trusted while a
+/// pairing is only pending.
+#[derive(Debug, Clone)]
+struct PendingPairing {
+    peer_id: String,
     display_name: String,
     address: String,
-    platform: Option<String>,
+    platform: String,
+    fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PairingInfo {
+    pub peer_id: String,
+    pub display_name: String,
+    pub address: String,
+    pub fingerprint: String,
+    pub platform: String,
+    /// True when this device is already in the trusted store — the UI can warn
+    /// that confirming will update the existing trust entry.
+    pub already_trusted: bool,
+}
+
+/// Resolves a discovered device's advertised identity and stages a pairing for
+/// user confirmation. This is the real "Trust" entry point: it never writes
+/// trust — it only fetches the peer's advertised certificate fingerprint and
+/// returns it so the user can verify it before `confirm_pairing`.
+///
+/// The fingerprint comes from the peer's own mDNS advertisement (published from
+/// its certificate), so a device can only be paired if it is actually present
+/// and advertising — mDNS presence alone is never sufficient to trust it.
+#[tauri::command]
+fn start_pairing(
+    peer_id: String,
+    address: String,
     state: State<'_, DesktopAppState>,
-) -> DesktopResult<store::TrustedDevice> {
-    let advertisement = cli::receiver_advertisement(&state.config()).map_err(error_to_string)?;
-    let fingerprint = match advertisement {
-        Some((advert_address, certificate_der)) if advert_address == address => {
-            store::certificate_fingerprint(&certificate_der)
-        }
-        _ => {
-            return Err(
-                "no certificate is held for this device yet — receive from or send to it first \
-                 to establish trust"
-                    .to_owned(),
-            );
-        }
+) -> DesktopResult<PairingInfo> {
+    // Look the device up in the live discovery set so we use the identity the
+    // remote peer is advertising right now, not any stale UI-supplied value.
+    let peers = discover_peers(&state.config()).map_err(error_to_string)?;
+    let matched = peers.into_iter().find(|peer| {
+        peer.peer_id == peer_id
+            || peer
+                .addresses
+                .iter()
+                .any(|candidate| addresses_match(candidate, peer.port, &address))
+    });
+
+    let peer = matched.ok_or_else(|| {
+        "device is not reachable for pairing — make sure it is on the network and receiving"
+            .to_owned()
+    })?;
+
+    stage_pairing(&state, peer, address)
+}
+
+/// Stages a discovered peer for confirmation: verifies it advertised a
+/// fingerprint, records a pending pairing, and returns the identity for the
+/// user to confirm. Never writes trust. Split from the command so it can be
+/// tested without a live mDNS scan.
+fn stage_pairing(
+    state: &DesktopAppState,
+    peer: DiscoveredPeer,
+    ui_address: String,
+) -> DesktopResult<PairingInfo> {
+    let fingerprint = peer.fingerprint.clone().ok_or_else(|| {
+        "device did not advertise a certificate fingerprint — it may be running an older \
+         version that does not support pairing"
+            .to_owned()
+    })?;
+
+    let resolved_address = peer
+        .addresses
+        .first()
+        .map(|ip| format!("{ip}:{}", peer.port))
+        .unwrap_or(ui_address);
+
+    let already_trusted = state
+        .store
+        .trusted_devices()
+        .iter()
+        .any(|device| device.id == peer.peer_id);
+
+    let pairing = PendingPairing {
+        peer_id: peer.peer_id.clone(),
+        display_name: peer.display_name.clone(),
+        address: resolved_address,
+        platform: "unknown".to_owned(),
+        fingerprint,
     };
 
+    if let Ok(mut pairings) = state.pairings.lock() {
+        pairings.insert(peer.peer_id.clone(), pairing.clone());
+    }
+
+    Ok(PairingInfo {
+        peer_id: pairing.peer_id,
+        display_name: pairing.display_name,
+        address: pairing.address,
+        fingerprint: pairing.fingerprint,
+        platform: pairing.platform,
+        already_trusted,
+    })
+}
+
+/// Confirms a pending pairing: after the user has verified the fingerprint,
+/// stores the device in `trusted-devices.json`. Fails if there is no pending
+/// pairing for `peer_id`, so trust is only ever written for a fingerprint the
+/// user actually saw and approved.
+#[tauri::command]
+fn confirm_pairing(
+    peer_id: String,
+    display_name: Option<String>,
+    state: State<'_, DesktopAppState>,
+) -> DesktopResult<store::TrustedDevice> {
+    confirm_pairing_inner(&state, &peer_id, display_name)
+}
+
+fn confirm_pairing_inner(
+    state: &DesktopAppState,
+    peer_id: &str,
+    display_name: Option<String>,
+) -> DesktopResult<store::TrustedDevice> {
+    let pairing = {
+        let mut pairings = state
+            .pairings
+            .lock()
+            .map_err(|_| "pairing state is unavailable".to_owned())?;
+        pairings.remove(peer_id).ok_or_else(|| {
+            "no pairing is awaiting confirmation for this device — start pairing again".to_owned()
+        })?
+    };
+
+    let display_name = display_name
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(pairing.display_name);
+
     Ok(state.store.trust_device(store::TrustedDevice {
-        id,
+        id: pairing.peer_id,
         display_name,
-        address,
-        platform: platform.unwrap_or_else(|| "unknown".to_owned()),
-        fingerprint,
+        address: pairing.address,
+        platform: pairing.platform,
+        fingerprint: pairing.fingerprint,
         first_trusted: 0,
         last_seen: store::unix_now(),
     }))
+}
+
+/// Discards a pending pairing without trusting the device. Used when the user
+/// rejects the fingerprint or closes the confirmation modal.
+#[tauri::command]
+fn cancel_pairing(peer_id: String, state: State<'_, DesktopAppState>) -> DesktopResult<bool> {
+    Ok(cancel_pairing_inner(&state, &peer_id))
+}
+
+fn cancel_pairing_inner(state: &DesktopAppState, peer_id: &str) -> bool {
+    state
+        .pairings
+        .lock()
+        .map(|mut pairings| pairings.remove(peer_id).is_some())
+        .unwrap_or(false)
+}
+
+/// Whether a discovered peer's `ip` + `port` matches a UI-supplied
+/// `ip:port` (or bare `ip`) target string.
+fn addresses_match(ip: &str, port: u16, target: &str) -> bool {
+    if let Some((target_ip, target_port)) = target.rsplit_once(':') {
+        target_ip == ip
+            && target_port
+                .parse::<u16>()
+                .map(|p| p == port)
+                .unwrap_or(false)
+    } else {
+        target == ip
+    }
 }
 
 #[tauri::command]
@@ -1706,7 +1856,9 @@ pub fn run() {
             list_incoming_requests,
             list_devices,
             list_trusted_devices,
-            trust_device,
+            start_pairing,
+            confirm_pairing,
+            cancel_pairing,
             untrust_device,
             rename_trusted_device,
             list_transfer_history,
@@ -2196,6 +2348,168 @@ mod tests {
             receive_dir: temp_path(&format!("{label}-recv")),
             chunk_size: 8,
         })
+    }
+
+    fn discovered(peer_id: &str, name: &str, fingerprint: Option<&str>) -> DiscoveredPeer {
+        DiscoveredPeer {
+            peer_id: peer_id.to_owned(),
+            display_name: name.to_owned(),
+            addresses: vec!["172.21.209.204".to_owned()],
+            port: 50038,
+            fingerprint: fingerprint.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn certificate_fingerprint_is_deterministic_and_grouped() {
+        // The fingerprint the receiver advertises must be stable and formatted
+        // as grouped uppercase SHA-256 hex, matching what gets stored on trust.
+        let fp1 = cli::certificate_fingerprint(b"nexo-certificate-bytes");
+        let fp2 = cli::certificate_fingerprint(b"nexo-certificate-bytes");
+        assert_eq!(fp1, fp2, "same cert must yield the same fingerprint");
+        assert_ne!(fp1, cli::certificate_fingerprint(b"a different cert"));
+
+        let groups: Vec<&str> = fp1.split(':').collect();
+        assert_eq!(groups.len(), 8, "fingerprint has 8 groups: {fp1}");
+        assert!(
+            groups
+                .iter()
+                .all(|g| g.len() == 4 && g.chars().all(|c| c.is_ascii_hexdigit())),
+            "each group is 4 hex digits: {fp1}"
+        );
+        assert_eq!(fp1, fp1.to_uppercase(), "fingerprint is uppercase");
+    }
+
+    #[test]
+    fn discovered_device_can_start_pairing_without_trusting() {
+        // Staging a discovered device returns its advertised fingerprint for
+        // confirmation but must NOT trust it yet.
+        let state = state_with_store("pair-start");
+        let peer = discovered("dev-a", "archlinux", Some("AAAA:BBBB:CCCC:DDDD"));
+
+        let info =
+            stage_pairing(&state, peer, "172.21.209.204:50038".to_owned()).expect("pairing stages");
+
+        assert_eq!(info.peer_id, "dev-a");
+        assert_eq!(info.fingerprint, "AAAA:BBBB:CCCC:DDDD");
+        assert_eq!(info.address, "172.21.209.204:50038");
+        assert!(!info.already_trusted);
+        // Critical: no trust written from starting a pairing.
+        assert!(
+            state.store.trusted_devices().is_empty(),
+            "starting a pairing must not trust the device"
+        );
+    }
+
+    #[test]
+    fn device_without_fingerprint_cannot_be_paired() {
+        // A peer that does not advertise a fingerprint (older version) cannot be
+        // paired — we refuse rather than trusting on discovery alone.
+        let state = state_with_store("pair-nofp");
+        let peer = discovered("dev-old", "legacy", None);
+        assert!(stage_pairing(&state, peer, "1.2.3.4:5".to_owned()).is_err());
+        assert!(state.store.trusted_devices().is_empty());
+    }
+
+    #[test]
+    fn confirming_pairing_creates_trust_with_fingerprint() {
+        let state = state_with_store("pair-confirm");
+        let info = stage_pairing(
+            &state,
+            discovered("dev-b", "workstation", Some("1111:2222:3333:4444")),
+            "172.21.209.204:50038".to_owned(),
+        )
+        .expect("stage");
+
+        let trusted = confirm_pairing_inner(&state, "dev-b", None).expect("confirm");
+        assert_eq!(trusted.id, "dev-b");
+        assert_eq!(trusted.fingerprint, info.fingerprint);
+        assert_eq!(trusted.display_name, "workstation");
+        assert!(trusted.first_trusted > 0, "first-trusted timestamp is set");
+
+        let stored = state.store.trusted_devices();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].fingerprint, "1111:2222:3333:4444");
+    }
+
+    #[test]
+    fn duplicate_trust_updates_in_place_keeping_first_trusted() {
+        // Pairing the same device twice must not create a duplicate entry, and
+        // must preserve the original first-trusted timestamp.
+        let state = state_with_store("pair-dup");
+        stage_pairing(
+            &state,
+            discovered("dev-c", "laptop", Some("DEAD:BEEF:0000:1111")),
+            "172.21.209.204:50038".to_owned(),
+        )
+        .unwrap();
+        let first = confirm_pairing_inner(&state, "dev-c", None).expect("first confirm");
+
+        // Pair again, this time renaming.
+        stage_pairing(
+            &state,
+            discovered("dev-c", "laptop", Some("DEAD:BEEF:0000:1111")),
+            "172.21.209.204:50038".to_owned(),
+        )
+        .unwrap();
+        let second =
+            confirm_pairing_inner(&state, "dev-c", Some("laptop-renamed".to_owned())).unwrap();
+
+        assert_eq!(state.store.trusted_devices().len(), 1, "no duplicate entry");
+        assert_eq!(
+            second.first_trusted, first.first_trusted,
+            "first-trusted preserved"
+        );
+        assert_eq!(second.display_name, "laptop-renamed");
+    }
+
+    #[test]
+    fn rejected_pairing_stores_no_trust() {
+        // Cancelling (rejecting the fingerprint) must drop the pending pairing
+        // and leave the device untrusted, and confirming afterwards must fail.
+        let state = state_with_store("pair-reject");
+        stage_pairing(
+            &state,
+            discovered("dev-d", "phone", Some("CAFE:CAFE:CAFE:CAFE")),
+            "172.21.209.204:50038".to_owned(),
+        )
+        .unwrap();
+
+        assert!(
+            cancel_pairing_inner(&state, "dev-d"),
+            "cancel finds the pending pairing"
+        );
+        assert!(
+            state.store.trusted_devices().is_empty(),
+            "rejecting a pairing must not trust the device"
+        );
+        assert!(
+            confirm_pairing_inner(&state, "dev-d", None).is_err(),
+            "confirming a cancelled pairing must fail"
+        );
+    }
+
+    #[test]
+    fn confirming_unknown_pairing_is_an_error() {
+        let state = state_with_store("pair-unknown");
+        assert!(confirm_pairing_inner(&state, "never-staged", None).is_err());
+        assert!(!cancel_pairing_inner(&state, "never-staged"));
+    }
+
+    #[test]
+    fn addresses_match_handles_ip_and_ip_port() {
+        assert!(addresses_match(
+            "172.21.209.204",
+            50038,
+            "172.21.209.204:50038"
+        ));
+        assert!(addresses_match("172.21.209.204", 50038, "172.21.209.204"));
+        assert!(!addresses_match(
+            "172.21.209.204",
+            50038,
+            "172.21.209.204:1"
+        ));
+        assert!(!addresses_match("172.21.209.204", 50038, "10.0.0.1:50038"));
     }
 
     #[test]

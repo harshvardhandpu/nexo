@@ -339,18 +339,28 @@ export function listTrustedDevices() {
   return invoke<TrustedDevice[]>("list_trusted_devices");
 }
 
-export function trustDevice(
-  id: string,
-  displayName: string,
-  address: string,
-  platform?: string,
-) {
-  return invoke<TrustedDevice>("trust_device", {
-    id,
-    displayName,
-    address,
-    platform: platform || null,
+export type PairingInfo = {
+  peerId: string;
+  displayName: string;
+  address: string;
+  fingerprint: string;
+  platform: string;
+  alreadyTrusted: boolean;
+};
+
+export function startPairing(peerId: string, address: string) {
+  return invoke<PairingInfo>("start_pairing", { peerId, address });
+}
+
+export function confirmPairing(peerId: string, displayName?: string) {
+  return invoke<TrustedDevice>("confirm_pairing", {
+    peerId,
+    displayName: displayName || null,
   });
+}
+
+export function cancelPairing(peerId: string) {
+  return invoke<boolean>("cancel_pairing", { peerId });
 }
 
 export function untrustDevice(id: string) {

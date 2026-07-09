@@ -6,10 +6,14 @@ import {
   ShieldPlus,
 } from "lucide-react";
 import {
+  type PairingInfo,
   type PeerDevice,
+  cancelPairing,
+  confirmPairing,
   listDevices,
-  trustDevice,
+  startPairing,
 } from "../api/desktop";
+import { PairingDialog } from "../components/PairingDialog";
 import {
   Banner,
   Empty,
@@ -61,7 +65,7 @@ function DeviceCard({
             onClick={() => onTrust(device)}
             loading={busy}
           >
-            Trust
+            {busy ? "Pairing…" : "Trust"}
           </NeonButton>
         )}
       </div>
@@ -74,6 +78,9 @@ export function DevicesScreen() {
   const [scanning, setScanning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  // The device whose fingerprint is awaiting confirmation, if any.
+  const [pairing, setPairing] = useState<PairingInfo | null>(null);
+  const [confirming, setConfirming] = useState(false);
 
   const scan = useCallback(async () => {
     setScanning(true);
@@ -93,21 +100,47 @@ export function DevicesScreen() {
     return () => window.clearInterval(timer);
   }, [scan]);
 
+  // Step 1: pairing — connect to the discovered device and fetch its advertised
+  // certificate fingerprint. This does NOT trust the device; it opens the
+  // confirmation modal so the user can verify the fingerprint first.
   const onTrust = async (device: PeerDevice) => {
     setBusyId(device.id);
     setError(null);
     try {
-      await trustDevice(
-        device.id,
-        device.displayName,
-        device.address,
-        device.platform,
-      );
-      await scan();
+      const info = await startPairing(device.id, device.address);
+      setPairing(info);
     } catch (cause) {
       setError(String(cause));
     } finally {
       setBusyId(null);
+    }
+  };
+
+  // Step 2: the user verified the fingerprint and approved — store the trust.
+  const onConfirm = async () => {
+    if (!pairing) return;
+    setConfirming(true);
+    setError(null);
+    try {
+      await confirmPairing(pairing.peerId, pairing.displayName);
+      setPairing(null);
+      await scan();
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setConfirming(false);
+    }
+  };
+
+  // Step 2 (rejected): drop the pending pairing on the backend; store nothing.
+  const onReject = async () => {
+    if (!pairing) return;
+    const peerId = pairing.peerId;
+    setPairing(null);
+    try {
+      await cancelPairing(peerId);
+    } catch {
+      // Cancellation is best-effort; the pending pairing expires with the app.
     }
   };
 
@@ -155,6 +188,15 @@ export function DevicesScreen() {
           </div>
         )}
       </GlassPanel>
+
+      {pairing ? (
+        <PairingDialog
+          pairing={pairing}
+          busy={confirming}
+          onConfirm={onConfirm}
+          onReject={onReject}
+        />
+      ) : null}
     </div>
   );
 }
