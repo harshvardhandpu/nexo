@@ -897,6 +897,43 @@ mod tests {
     }
 
     #[test]
+    fn restarted_receiver_updates_endpoint_in_place_not_duplicated() {
+        // The reported bug: a receiver restarts with the SAME identity (peer id,
+        // hostname/fullname, certificate) but a NEW QUIC port. Discovery must
+        // merge it into the existing peer — one cached entry, endpoint updated —
+        // rather than creating a second device.
+        let mut cache = PeerCache::new(PeerId("local".to_owned()), Duration::from_secs(60));
+        let now = Instant::now();
+
+        let mut first = resolved("archlinux", "archlinux", 60897, "nexo-archlinux.local.");
+        first.info.fingerprint = Some("AAAA:BBBB:CCCC:DDDD".to_owned());
+        cache.handle_resolved(first, now);
+        assert!(matches!(
+            cache.pop_event(),
+            Some(DiscoveryEvent::PeerDiscovered(_))
+        ));
+
+        // Same peer id + fullname + fingerprint, new port.
+        let mut restarted = resolved("archlinux", "archlinux", 63455, "nexo-archlinux.local.");
+        restarted.info.fingerprint = Some("AAAA:BBBB:CCCC:DDDD".to_owned());
+        cache.handle_resolved(restarted, now);
+
+        // Exactly one device, at the new endpoint, surfaced as an update.
+        let peers = cache.peers();
+        assert_eq!(
+            peers.len(),
+            1,
+            "restart must not duplicate the peer: {peers:?}"
+        );
+        assert_eq!(peers[0].port, 63455, "endpoint updated to the new port");
+        assert_eq!(peers[0].peer_id.0, "archlinux");
+        assert_eq!(
+            cache.pop_event(),
+            Some(DiscoveryEvent::PeerUpdated(peers[0].clone()))
+        );
+    }
+
+    #[test]
     fn peer_cache_ignores_local_peer_and_expires_stale_peers() {
         let mut cache = PeerCache::new(PeerId("local".to_owned()), Duration::from_millis(1));
         let now = Instant::now();

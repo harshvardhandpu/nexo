@@ -245,6 +245,32 @@ impl AppStore {
         }
     }
 
+    /// Updates the stored endpoint (and `last_seen`) of the trusted device whose
+    /// certificate `fingerprint` matches — a device is identified by its
+    /// certificate, not its socket address. This is what keeps a *restarted*
+    /// receiver (same cert, new QUIC port) a single entry: its live address
+    /// replaces the stale stored one instead of spawning a duplicate. No-op if
+    /// no trusted device has that fingerprint. Returns true when a device was
+    /// updated.
+    pub fn refresh_endpoint(&self, fingerprint: &str, address: &str, now: u64) -> bool {
+        let _lock = self.guard.lock();
+        let mut file = read_json::<TrustedDevicesFile>(&self.trusted_path());
+        let mut changed = false;
+        for device in file.devices.iter_mut() {
+            if device.fingerprint == fingerprint {
+                if device.address != address {
+                    device.address = address.to_owned();
+                }
+                device.last_seen = now;
+                changed = true;
+            }
+        }
+        if changed {
+            write_json(&self.state_dir, &self.trusted_path(), &file);
+        }
+        changed
+    }
+
     // ---- Transfer history -------------------------------------------------
 
     pub fn history(&self) -> Vec<TransferRecord> {
@@ -444,6 +470,33 @@ mod tests {
         let b = devices.iter().find(|d| d.id == "b").expect("b");
         assert_eq!(a.last_seen, 12345);
         assert_eq!(b.last_seen, 0);
+    }
+
+    #[test]
+    fn refresh_endpoint_replaces_stale_address_by_fingerprint() {
+        // A restarted receiver keeps the same certificate (fingerprint) but binds
+        // a new port. refresh_endpoint must update the stored address in place,
+        // not create a duplicate, and must not touch a different device.
+        let store = temp_store("refresh");
+        let a = store.trust_device(device("a", "A", "172.21.209.204:60897"));
+        store.trust_device(device("b", "B", "10.0.0.2:2"));
+
+        // Same cert/fingerprint as device "a", new port.
+        let updated = store.refresh_endpoint(&a.fingerprint, "172.21.209.204:63455", 999);
+        assert!(updated, "matching fingerprint updates the device");
+
+        let devices = store.trusted_devices();
+        assert_eq!(devices.len(), 2, "no duplicate entry created");
+        let a = devices.iter().find(|d| d.id == "a").expect("a");
+        assert_eq!(a.address, "172.21.209.204:63455", "address replaced");
+        assert_eq!(a.last_seen, 999);
+        // Unrelated device untouched.
+        let b = devices.iter().find(|d| d.id == "b").expect("b");
+        assert_eq!(b.address, "10.0.0.2:2");
+        assert_eq!(b.last_seen, 0);
+
+        // An unknown fingerprint is a no-op.
+        assert!(!store.refresh_endpoint("NO:SUCH:FINGERPRINT", "1.2.3.4:5", 1000));
     }
 
     #[test]

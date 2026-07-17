@@ -85,6 +85,10 @@ struct PeerPresence {
     address: String,
     platform: String,
     last_seen: u64,
+    /// The peer's advertised certificate fingerprint, when known. Used to merge
+    /// a restarted receiver (same cert, new port) with its trusted entry so it
+    /// shows as one device rather than duplicating.
+    fingerprint: Option<String>,
 }
 
 /// UI-facing device presence model (Feature 1).
@@ -1158,6 +1162,9 @@ fn list_devices(state: State<'_, DesktopAppState>) -> DesktopResult<Vec<PeerDevi
             .map(|address| format!("{address}:{}", peer.port))
             .unwrap_or_default();
         seen_addresses.push(address.clone());
+        // Presence is keyed by the peer's stable id, so a restarted receiver
+        // (same id, new port) overwrites its own entry rather than adding a new
+        // one.
         presence.insert(
             peer.peer_id.clone(),
             PeerPresence {
@@ -1165,27 +1172,71 @@ fn list_devices(state: State<'_, DesktopAppState>) -> DesktopResult<Vec<PeerDevi
                 address,
                 platform: "unknown".to_owned(),
                 last_seen: now,
+                fingerprint: peer.fingerprint.clone(),
             },
         );
     }
     drop(presence);
 
-    // Keep trusted-device last_seen fresh for the ones currently visible.
-    state.store.touch_last_seen(&seen_addresses, now);
+    // Fold the live scan into the trusted store: a device is identified by its
+    // certificate fingerprint, so a restarted receiver's *current* address
+    // replaces the stale stored one (and refreshes last_seen). Devices without
+    // an advertised fingerprint fall back to address-based last_seen refresh.
+    for peer in &discovered {
+        let address = peer
+            .addresses
+            .first()
+            .map(|address| format!("{address}:{}", peer.port))
+            .unwrap_or_default();
+        match &peer.fingerprint {
+            Some(fingerprint) => {
+                state.store.refresh_endpoint(fingerprint, &address, now);
+            }
+            None => state.store.touch_last_seen(&[address], now),
+        }
+    }
     let trusted = state.store.trusted_devices();
 
     let presence = state
         .presence
         .lock()
         .map_err(|_| "desktop presence registry is unavailable".to_owned())?;
+
+    Ok(merge_device_list(&presence, &trusted, now))
+}
+
+/// Merges the live presence map with the trusted store into the device list the
+/// UI shows. A device is identified by its certificate fingerprint, so a
+/// restarted receiver (same cert, new port) is one row: its trusted entry is
+/// matched by fingerprint, and its stale stored address is never re-added as a
+/// second, offline row. Pure (no I/O) so it can be unit-tested.
+fn merge_device_list(
+    presence: &HashMap<String, PeerPresence>,
+    trusted: &[store::TrustedDevice],
+    now: u64,
+) -> Vec<PeerDevice> {
+    // The trusted entry for a live presence record: by fingerprint (identity)
+    // first, then by address for legacy entries that stored no fingerprint.
+    let trusted_for = |entry: &PeerPresence| -> Option<&store::TrustedDevice> {
+        if let Some(fingerprint) = &entry.fingerprint
+            && let Some(device) = trusted.iter().find(|d| &d.fingerprint == fingerprint)
+        {
+            return Some(device);
+        }
+        trusted
+            .iter()
+            .find(|device| device.address == entry.address)
+    };
+
     let mut devices: Vec<PeerDevice> = presence
         .iter()
-        .map(|(id, entry)| {
-            let trusted_entry = trusted
-                .iter()
-                .find(|device| device.address == entry.address);
+        .map(|(peer_id, entry)| {
+            let trusted_entry = trusted_for(entry);
             PeerDevice {
-                id: id.clone(),
+                // The peer's stable id (also the trusted id after pairing, since
+                // trust is keyed on the discovered peer_id) — one row per device
+                // across restarts, and the value the pairing flow expects.
+                id: peer_id.clone(),
                 display_name: trusted_entry
                     .map(|device| device.display_name.clone())
                     .unwrap_or_else(|| entry.display_name.clone()),
@@ -1198,9 +1249,15 @@ fn list_devices(state: State<'_, DesktopAppState>) -> DesktopResult<Vec<PeerDevi
         })
         .collect();
 
-    // Trusted devices not currently visible still appear, as offline.
-    for device in &trusted {
-        if !devices.iter().any(|known| known.address == device.address) {
+    // Trusted devices not currently visible still appear, as offline — but only
+    // if not already shown live. Match by fingerprint (identity) so a restarted
+    // receiver seen at a new address is NOT duplicated by its stale stored one.
+    for device in trusted {
+        let already_shown = devices.iter().any(|known| known.id == device.id)
+            || presence
+                .values()
+                .any(|entry| entry.fingerprint.as_deref() == Some(device.fingerprint.as_str()));
+        if !already_shown {
             devices.push(PeerDevice {
                 id: device.id.clone(),
                 display_name: device.display_name.clone(),
@@ -1218,7 +1275,7 @@ fn list_devices(state: State<'_, DesktopAppState>) -> DesktopResult<Vec<PeerDevi
             .cmp(&a.online)
             .then_with(|| a.display_name.cmp(&b.display_name))
     });
-    Ok(devices)
+    devices
 }
 
 // ---- Feature 2: trusted devices ------------------------------------------
@@ -2764,6 +2821,91 @@ mod tests {
         let mut legacy = trusted_device_with_cert("old", "10.0.0.9:41000", b"x");
         legacy.certificate_der = Vec::new();
         assert!(resolve_trusted_target_from(&[legacy], &[], None).is_none());
+    }
+
+    fn presence_entry(address: &str, fingerprint: Option<&str>, last_seen: u64) -> PeerPresence {
+        PeerPresence {
+            display_name: "archlinux".to_owned(),
+            address: address.to_owned(),
+            platform: "unknown".to_owned(),
+            last_seen,
+            fingerprint: fingerprint.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn restarted_receiver_shows_as_one_device_not_a_duplicate() {
+        // A trusted receiver restarts: same certificate (fingerprint), new port.
+        // The trusted store already holds the refreshed address (via
+        // refresh_endpoint), and the live presence shows the new endpoint. The
+        // merged list must contain exactly one row for this device — not the
+        // live one plus a stale offline copy.
+        let cert = fake_cert("dev-x");
+        let fp = store::certificate_fingerprint(&cert);
+        let trusted = vec![trusted_device_with_cert(
+            "dev-x",
+            "172.21.209.204:63455",
+            &cert,
+        )];
+
+        // Presence keyed by the stable peer id, at the new port.
+        let mut presence = std::collections::HashMap::new();
+        presence.insert(
+            "dev-x".to_owned(),
+            presence_entry("172.21.209.204:63455", Some(&fp), 100),
+        );
+
+        let devices = merge_device_list(&presence, &trusted, 100);
+        assert_eq!(devices.len(), 1, "one row per device: {devices:?}");
+        let d = &devices[0];
+        assert_eq!(d.id, "dev-x");
+        assert!(d.trusted);
+        assert!(d.online);
+        assert_eq!(d.address, "172.21.209.204:63455", "shows the live address");
+    }
+
+    #[test]
+    fn stale_stored_address_does_not_add_a_second_offline_row() {
+        // Even if the trusted store still had the OLD address, matching by
+        // fingerprint means the live presence covers it — no duplicate offline
+        // row is appended for the stale address.
+        let cert = fake_cert("dev-y");
+        let fp = store::certificate_fingerprint(&cert);
+        // Trusted entry still on the old port.
+        let trusted = vec![trusted_device_with_cert(
+            "dev-y",
+            "172.21.209.204:60897",
+            &cert,
+        )];
+        // Live presence on the new port, same fingerprint.
+        let mut presence = std::collections::HashMap::new();
+        presence.insert(
+            "dev-y".to_owned(),
+            presence_entry("172.21.209.204:63455", Some(&fp), 200),
+        );
+
+        let devices = merge_device_list(&presence, &trusted, 200);
+        assert_eq!(
+            devices.len(),
+            1,
+            "stale stored address must not create a second row: {devices:?}"
+        );
+        assert_eq!(devices[0].address, "172.21.209.204:63455");
+    }
+
+    #[test]
+    fn trusted_but_offline_device_still_listed_once() {
+        // No live presence: a trusted device still appears, exactly once, offline.
+        let cert = fake_cert("dev-z");
+        let trusted = vec![trusted_device_with_cert(
+            "dev-z",
+            "172.21.209.204:41000",
+            &cert,
+        )];
+        let devices = merge_device_list(&std::collections::HashMap::new(), &trusted, 9_999_999);
+        assert_eq!(devices.len(), 1);
+        assert!(!devices[0].online);
+        assert!(devices[0].trusted);
     }
 
     #[test]
