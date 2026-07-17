@@ -86,6 +86,48 @@ fn local_discovery_advertises_discovers_expires_and_lists_multiple_peers() {
     timeout_observer.shutdown().expect("stop timeout observer");
 }
 
+#[test]
+#[ignore = "requires reliable local mDNS multicast loopback"]
+fn self_discovery_sees_own_receiver_advertisement() {
+    // Desktop self-transfer relies on the device discovering its OWN receiver.
+    // The receiver advertises under a distinct "{peer_id}-recv" id while the
+    // discovery browser filters out only the device's own "{peer_id}". The two
+    // differ, so the browser must surface the local receiver — with the exact
+    // fingerprint + certificate the send path needs to pin. This runs the
+    // advertiser and the browser in the SAME process, as the desktop does.
+    let run_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    let device_id = PeerId(format!("selfdev-{run_id}"));
+    let receiver_id = PeerId(format!("{}-recv", device_id.0));
+
+    // The local receiver, advertising its own certificate for pairing.
+    let mut receiver = provider_with_fingerprint(
+        receiver_id.clone(),
+        "This-Device",
+        41010,
+        "SELF:AAAA:BBBB:CCCC",
+    );
+
+    // The device's own discovery browser filters out `device_id`, NOT
+    // `receiver_id` — so it should still see the local receiver.
+    let mut browser = provider(device_id, "This-Device", 0);
+
+    let seen = wait_for_peer(&mut browser, &receiver_id);
+    assert_eq!(seen.display_name, "This-Device");
+    assert_eq!(seen.port, 41010);
+    assert_eq!(seen.fingerprint.as_deref(), Some("SELF:AAAA:BBBB:CCCC"));
+    assert_eq!(
+        seen.certificate_der,
+        Some(sample_certificate()),
+        "the local receiver's certificate must round-trip so self-send can pin it"
+    );
+
+    receiver.shutdown().expect("stop receiver advertisement");
+    browser.shutdown().expect("stop browser");
+}
+
 fn provider(peer_id: PeerId, display_name: &str, port: u16) -> LocalDiscoveryProvider {
     provider_with_timeout(peer_id, display_name, port, Duration::from_secs(10))
 }

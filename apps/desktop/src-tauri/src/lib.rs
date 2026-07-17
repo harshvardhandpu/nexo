@@ -2731,6 +2731,43 @@ mod tests {
         assert!(!cancel_pairing_inner(&state, "never-staged"));
     }
 
+    #[test]
+    fn self_pairing_trusts_own_receiver_and_resolves_as_send_target() {
+        // Desktop self-transfer: the device discovers its OWN receiver (which
+        // advertises under "{peer_id}-recv" with the device's own certificate),
+        // pairs with it, and must then resolve itself as a normal trusted send
+        // target. No self-copy shortcut — the resolved target carries the real
+        // certificate that the QUIC client will pin against the live endpoint.
+        let state = state_with_store("self-pair");
+        let own_cert = fake_cert("this-device-recv");
+        // The self-advertisement, exactly as the local receiver publishes it.
+        let self_peer = discovered("this-device-recv", "This-Device", Some(&own_cert));
+
+        // Pair with self.
+        let info = stage_pairing(&state, self_peer.clone(), "172.21.209.204:50038".to_owned())
+            .expect("stage self pairing");
+        let trusted = confirm_pairing_inner(&state, "this-device-recv", None).expect("confirm");
+        assert_eq!(trusted.id, "this-device-recv");
+        assert_eq!(trusted.fingerprint, info.fingerprint);
+        assert_eq!(trusted.certificate_der, own_cert);
+
+        // Resolve self as a send target against the live self-advert.
+        let live = vec![live_peer(
+            "this-device-recv",
+            "172.21.209.204",
+            50038,
+            &own_cert,
+        )];
+        let host = "172.21.209.204:50038".parse().ok();
+        let target = resolve_trusted_target_from(&state.store.trusted_devices(), &live, host)
+            .expect("self resolves as a trusted target");
+        assert_eq!(
+            target.certificate_der, own_cert,
+            "self-send pins the device's own real certificate"
+        );
+        assert_eq!(target.address, "172.21.209.204:50038".parse().unwrap());
+    }
+
     fn trusted_device_with_cert(
         id: &str,
         address: &str,

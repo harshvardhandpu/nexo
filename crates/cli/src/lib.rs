@@ -2462,6 +2462,64 @@ mod tests {
     }
 
     #[test]
+    fn self_transfer_sends_to_own_receiver_over_full_quic_path() {
+        // Reproduction / regression for desktop self-transfer: ONE config runs
+        // the receiver and also sends a file to its OWN advertised endpoint using
+        // its OWN certificate. This exercises the complete production path — QUIC,
+        // pairing cert pinning, chunking, encryption, integrity — with no special
+        // self-copy shortcut. The sender is the same identity as the receiver.
+        let workspace = TempWorkspace::new("quic-cli-self");
+        let source = workspace.path("source.txt");
+        let receive_dir = workspace.path("received");
+        let config = CliConfig {
+            state_dir: workspace.path("state"),
+            receive_dir: receive_dir.clone(),
+            chunk_size: 8,
+        };
+        fs::create_dir_all(&receive_dir).expect("receive dir");
+        let payload = b"nexo sends this file to itself over real QUIC".to_vec();
+        fs::write(&source, &payload).expect("source");
+
+        let receiver_config = config.clone();
+        let receiver = thread::spawn(move || {
+            let mut output = Vec::new();
+            run_receive(&receiver_config, &mut output)?;
+            String::from_utf8(output).map_err(|error| {
+                Box::new(IoError::new(ErrorKind::InvalidData, error))
+                    as Box<dyn Error + Send + Sync>
+            })
+        });
+        wait_for_receiver_advert(&config);
+
+        // The device's own advertised endpoint + certificate — exactly what the
+        // desktop would resolve for "send to this same device".
+        let advert = load_receiver_advert(&config).expect("own receiver advert");
+
+        let mut send_output = Vec::new();
+        run_send_to_peer(
+            &source,
+            advert.address,
+            advert.certificate_der,
+            &config,
+            &mut send_output,
+        )
+        .expect("self-send over quic");
+
+        let receive_output = receiver.join().expect("receiver thread").expect("output");
+        assert_eq!(
+            fs::read(receive_dir.join("source.txt")).expect("received"),
+            payload,
+            "self-transferred bytes must match the source exactly"
+        );
+        assert!(
+            String::from_utf8(send_output)
+                .expect("send utf8")
+                .contains("transfer complete")
+        );
+        assert!(receive_output.contains("completed"));
+    }
+
+    #[test]
     fn send_and_receive_resumes_from_verified_receiver_checkpoint() {
         let workspace = TempWorkspace::new("quic-cli-resume");
         let source = workspace.path("source.txt");
